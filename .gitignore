@@ -1,0 +1,17 @@
+# generated results
+output/
+.DS_Store
+
+# not part of the public repo
+*.docx
+download/
+_pre_github_backup/
+_to_delete/
+20260211_weak_uORFs_1uORF.R
+20260826_weak_uORFs_1uORF.R
+20260826_weak_uORFs_1uORF copy.R
+
+# large raw inputs: the repo ships the .zip versions instead
+# (unzip them into Files/ before running the script)
+Files/CTRL_expressed_P_sites_sort_count
+Files/TAIR10_chr_all_2.fas
