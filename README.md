@@ -1,6 +1,6 @@
 # TSS heterogeneity and the uORF landscape in Arabidopsis
 
-Analysis code for the manuscript **"Transcription Start Site Heterogeneity Confounds the Landscape and Functional Interpretation of uORFs"** (Hsu lab; manuscript in preparation).
+Analysis code for the manuscript **"Transcription Start Site Heterogeneity Confounds the Landscape and Functional Interpretation of uORFs"**.
 
 Upstream open reading frames (uORFs) are usually annotated on the longest transcript isoform, but transcription start site (TSS) selection determines whether a uORF is actually present in an mRNA. This repository contains a single R script, `20260827_weak_uORFs.R`, that computes, for every translated uORF (TuORF) identified by Ribo-seq (RiboTaper + CiPS), the fraction of transcripts that include the uORF (**%uORF+**, called `pUP` in the code) from TSS profiling data (CAGE-seq by default, or TSS-seq from Nielsen et al. 2019), and combines it with RNA-seq/Ribo-seq quantification, reporter assays, and public datasets to ask how TSS selection shapes uORF inclusion and function. The script reproduces the figures, supplementary tables, and headline numbers of the manuscript.
 
