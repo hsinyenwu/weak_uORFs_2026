@@ -30,7 +30,29 @@ OUT_DIR_MAIN <- "output"
 
 ## --- uORF identification and annotation -------------------------------------
 PATH_RT_ORFS <- file.path(DATA_DIR, "ORFs_max_filt_expressed")       # RiboTaper ORF calls (expressed set)
-PATH_CIPS    <- file.path(DATA_DIR, "CiPS_uORF_Final.xlsx")          # CiPS TuORF calls
+## CiPS calls. Since 2026-10-27 the LATEST CiPS run is used (the ouORF-paper run, July 2026:
+## all Araport11 isoforms; uORFs overlapping the CDS of ANY same-gene isoform removed; isoform
+## versions with identical P-site evidence consolidated; criteria in
+## ouORF_submission/output/ORF_filtering_criteria.xlsx). In those files "nuORF" = non-
+## overlapping uORF (entirely within the 5'UTR) = the TuORF input used here, and "ouORF" =
+## overlapping uORF (starts in the 5'UTR, stop inside the CDS). ouORFs are used to EXCLUDE
+## genes with other detected upstream translation from every No-TuORF control, the UuORF
+## candidate set and the single-TuORF cohort (Reviewer 2, Genome Research, Oct 2026), and
+## for the TuORF+ouORF prevalence ladder of the transcriptome-impact module.
+PATH_CIPS       <- file.path(DATA_DIR, "CiPS_nuORF_all_Final.xlsx")   # CiPS TuORF calls (latest; until 2026-10-27: CiPS_uORF_Final.xlsx, Dec 2025 run)
+PATH_CIPS_OUORF <- file.path(DATA_DIR, "CiPS_ouORF_all_Final.xlsx")   # CiPS overlapping-uORF calls (latest)
+
+## How ouORFs are used (decision 2026-10-27, default = FALSE):
+##   FALSE (main analysis): ouORFs are EXCLUSIONS only. Genes with any detected ouORF are removed
+##         from every No-TuORF control, from the UuORF candidate set and from the single-TuORF
+##         cohort; ouORFs also enter the TuORF+ouORF prevalence ladder ("U." rows of the
+##         transcriptome-impact table, Figure 3C), where a transcript counts as affected if it
+##         carries a translated uORF OR ouORF.
+##   TRUE  (robustness run, output_latestCiPS_ouORFasTuORF_20261027/): ouORFs passing the
+##         5'UTR-masked criteria are ALSO treated as TuORFs in the uIF-based analyses, with uIF
+##         computed on the 5'UTR portion (see section 1 and 2B). Results barely change
+##         (r 0.61 -> 0.63; 11.1% -> 11.6% genes at 100% uORF+), so this is not the default.
+INCLUDE_OUORF_AS_TUORF <- FALSE
 PATH_GTF     <- file.path(DATA_DIR, "Araport11+CTRL_20181206.gtf")   # Araport11 annotation used throughout
 PATH_GTF2    <- file.path(DATA_DIR, "Araport11_20181206_max2_expressed_isoform_TPM0.5_rm_diff_CDSstart.gtf")
                                                                      # expressed-isoform annotation (Figure 4 TxDb)
@@ -109,10 +131,109 @@ suppressPackageStartupMessages({
 })
 
 ################################################################################
+# 0e) COMPATIBILITY SHIM + SHARED HELPERS (added 2026-10-27, Genome Research revision)
+################################################################################
+## makeTxDbFromGFF() moved to the txdbmaker package in Bioconductor 3.19+ and is
+## defunct in GenomicFeatures >= 1.61. Use txdbmaker when installed, else fall back
+## to GenomicFeatures (Bioconductor 3.18 / R 4.3, where the script was developed).
+.make_txdb <- function(file, format = "gtf", ...) {
+  if (requireNamespace("txdbmaker", quietly = TRUE)) {
+    txdbmaker::makeTxDbFromGFF(file = file, format = format, ...)
+  } else {
+    GenomicFeatures::makeTxDbFromGFF(file = file, format = format, ...)
+  }
+}
+
+## TSS-counting window per transcript: the ONE definition behind every transcript-
+## based %uORF+ (pUP) calculation — section 3 (TuORFs), .compute_pUP_from_source()
+## (Table S1B) and the predicted-uORF rows of the transcriptome-impact module.
+##
+## mode = "utr5" (DEFAULT, since 2026-10-27 = Methods definition):
+##   the annotated 5'UTR exon piece(s) of the transcript plus `upstream` nt beyond the
+##   annotated transcript start. TSS signal inside the CDS/3'UTR (or in leader
+##   introns) is NOT counted, so %uORF+ = share of leader/promoter-initiated
+##   transcripts whose 5' end lies upstream of (or at) the uORF start.
+##   Transcripts without an annotated 5'UTR get no window (pUP -> 0 downstream).
+## mode = "full_tx" (the definition used up to the Genome Research submission):
+##   `upstream` nt plus the FULL transcript (5'UTR + CDS + 3'UTR). Reviewer 2
+##   (Oct 2026) flagged that the code used this while the Methods said 5'UTR + 100.
+##   Kept only for the %mORF+ panel (Figure 1&3 add-on, ms Fig S4), where a 5'UTR
+##   window would make every mORF trivially 100%.
+## (The UuORF module, Figure 4/S5, and the ATG-frequency module, Figure 6/3, build
+##  their own 5'UTR + 100 nt windows; the correlation module restricts CAGE to the
+##  5'UTR in transcript coordinates. All consistent with "utr5".)
+.make_tss_windows <- function(txdb, tx_ids, upstream = 100, mode = c("utr5", "full_tx")) {
+  mode <- match.arg(mode)
+  if (mode == "full_tx") {
+    tx <- GenomicFeatures::transcripts(txdb, use.names = TRUE)
+    tx <- tx[names(tx) %in% tx_ids]
+    w  <- suppressWarnings(GenomicRanges::promoters(
+      tx, upstream = upstream, downstream = BiocGenerics::width(tx)
+    ))
+    return(GenomicRanges::trim(w))
+  }
+  utr <- GenomicFeatures::fiveUTRsByTranscript(txdb, use.names = TRUE)
+  utr <- utr[names(utr) %in% tx_ids]
+  utr <- utr[S4Vectors::elementNROWS(utr) > 0]
+  ul  <- BiocGenerics::unlist(utr, use.names = FALSE)
+  tx  <- rep(names(utr), S4Vectors::elementNROWS(utr))
+  plus <- as.character(BiocGenerics::strand(ul)) == "+"
+  key  <- ifelse(plus, BiocGenerics::start(ul), -BiocGenerics::end(ul))   # smaller = more 5'
+  o    <- order(tx, key)
+  idx  <- o[!duplicated(tx[o])]                                           # 5'-most piece per transcript
+  ul[idx] <- GenomicRanges::resize(ul[idx], width = BiocGenerics::width(ul[idx]) + upstream, fix = "end")  # strand-aware 5' extension
+  ul   <- GenomicRanges::restrict(ul, start = 1L)
+  GenomicRanges::split(ul, tx)                                            # GRangesList named by tx_id
+}
+
+## %uORF+ (pUP) for arbitrary ORF starts against a TSS signal file (CAGE-seq or
+## TSS-seq; 4 columns: count, chr, position, strand), using a given set of
+## transcript windows. Mirrors section 3 exactly:
+##   pUP = 100 * (signal at or upstream of the ORF start) / (all signal in the window)
+##   pUP = 0 when the window has no signal.
+## targets: data.frame with tx_id, uORF_start_bio (genomic coordinate of the A of
+##          the AUG: min for "+", max for "-"), Strand ("+"/"-"), unique_key.
+.compute_pUP_for_targets <- function(tss_path, targets, windows) {
+  raw <- read.delim(tss_path, header = FALSE, stringsAsFactors = FALSE, sep = "\t")
+  colnames(raw)[1:4] <- c("count", "chr", "start", "strand")
+  raw$end <- raw$start
+  raw$chr <- gsub("^chr|^Chr", "", raw$chr, ignore.case = TRUE)
+  gr <- GenomicRanges::makeGRangesFromDataFrame(raw, keep.extra.columns = TRUE)
+  try({ GenomeInfoDb::seqlevelsStyle(gr) <- GenomeInfoDb::seqlevelsStyle(windows) }, silent = TRUE)
+  lv <- intersect(GenomeInfoDb::seqlevels(gr), GenomeInfoDb::seqlevels(windows))
+  gr <- GenomeInfoDb::keepSeqlevels(gr, lv, pruning.mode = "coarse")
+  tw <- GenomeInfoDb::keepSeqlevels(windows, lv, pruning.mode = "coarse")
+  ov <- GenomicRanges::findOverlaps(gr, tw)
+  dtc <- data.table::data.table(
+    tx_id      = names(tw)[S4Vectors::subjectHits(ov)],
+    cage_coord = BiocGenerics::start(gr)[S4Vectors::queryHits(ov)],
+    count      = gr$count[S4Vectors::queryHits(ov)]
+  )
+  dtt <- data.table::data.table(
+    tx_id          = as.character(targets$tx_id),
+    uORF_start_bio = as.integer(targets$uORF_start_bio),
+    Strand         = as.character(targets$Strand),
+    unique_key     = as.character(targets$unique_key)
+  )
+  dj <- dtc[dtt, on = .(tx_id), allow.cartesian = TRUE]
+  dj[, .(
+    pUP = {
+      tc <- sum(count, na.rm = TRUE)
+      if (tc == 0 || is.na(tc)) 0 else {
+        Cb <- if (Strand[1] == "+") sum(count[cage_coord <= uORF_start_bio], na.rm = TRUE)
+        else                        sum(count[cage_coord >= uORF_start_bio], na.rm = TRUE)
+        (Cb / tc) * 100
+      }
+    }
+  ), by = .(unique_key)]
+}
+
+################################################################################
 # 0d) SMALL FILE CHECKS
 ################################################################################
 stopifnot(file.exists(PATH_RT_ORFS))
 stopifnot(file.exists(PATH_CIPS))
+stopifnot(file.exists(PATH_CIPS_OUORF))
 stopifnot(file.exists(PATH_GTF))
 stopifnot(file.exists(PATH_RIBO_P))
 stopifnot(file.exists(PATH_CAGE))
@@ -169,11 +290,13 @@ get_pairwise_ks_pvalues_clean <- function(data, group_col, val_col, id_map) {
 }
 
 reorder_letters_by_appearance <- function(named_letters, ordered_groups) {
+  # Re-letter so that the first group reads "a", keeping shared letters (e.g. "ab") per character.
+  # (Fixed 2026-10-28: the previous version mapped whole codes, so a group coded "ab" received a
+  #  single new letter and lost its shared-letter meaning; no submitted panel was affected.)
   current_sequence <- named_letters[ordered_groups]
-  unique_codes <- unique(current_sequence)
-  new_alphabet <- letters[1:length(unique_codes)]
-  mapping <- setNames(new_alphabet, unique_codes)
-  new_letters <- mapping[named_letters]
+  unique_chars <- unique(unlist(strsplit(unname(current_sequence), "")))
+  mapping <- setNames(letters[seq_along(unique_chars)], unique_chars)
+  new_letters <- vapply(unname(named_letters), function(code) paste(mapping[strsplit(code, "")[[1]]], collapse = ""), character(1))
   names(new_letters) <- names(named_letters)
   new_letters
 }
@@ -318,7 +441,9 @@ standardize_evidence_types <- function(df) {
       uORF_P_sites   = as.numeric(uORF_P_sites),
       uORF_length    = as.integer(uORF_length),
       uORF_length_nt = as.integer(uORF_length_nt),
-      uORF_TL        = as.numeric(uORF_TL)
+      uORF_TL        = as.numeric(uORF_TL),
+      ORF_type       = as.character(ORF_type),
+      TL_region_nt   = as.integer(TL_region_nt)
     )
 }
 
@@ -444,9 +569,45 @@ CiPS <- openxlsx::read.xlsx(PATH_CIPS)
 if ("AA" %in% colnames(CiPS) && !"pept_length" %in% colnames(CiPS)) {
   CiPS <- CiPS %>% dplyr::rename(pept_length = AA)
 }
+# latest CiPS files name the ranges nuORF_*; harmonize to the uORF_* names used below.
+# Only "start-end" strings are kept; anything else is recomputed from the genomic endpoints.
+if ("nuORF_Tx_range" %in% colnames(CiPS) && !"uORF_Tx_range" %in% colnames(CiPS)) {
+  v <- as.character(CiPS$nuORF_Tx_range)
+  CiPS$uORF_Tx_range <- ifelse(grepl("^[0-9]+-[0-9]+$", v), v, NA_character_)
+}
+if ("nuORF_Ge_range" %in% colnames(CiPS) && !"uORF_Ge_range" %in% colnames(CiPS)) CiPS$uORF_Ge_range <- CiPS$nuORF_Ge_range
 if (!"uORF_Tx_range" %in% colnames(CiPS)) CiPS$uORF_Tx_range <- NA_character_
+CiPS$ORF_type <- "uORF"
 
-txdb <- GenomicFeatures::makeTxDbFromGFF(
+# ---- overlapping uORFs (ouORFs) enter the evidence set as TuORFs (decision 2026-10-27) ----
+# Only ouORFs passing the 5'UTR-masked criteria (Pass_ouORF_criteria) are used, and ouORFs whose
+# start codon is identical to a nuORF's are dropped (same initiation event, already in the uORF
+# set). Their InFrameC/TotalC are P-sites in the 5'UTR PORTION only (CDS overlap masked), so the
+# uORF translation level (uORF_TL) is computed on that portion: TotalC / TL_region_nt, where
+# TL_region_nt = number of ORF nucleotides upstream of the CDS start (set in section 2B).
+# uORF_length (aa) keeps the full ORF length; length-based analyses use ORF_type == "uORF" only.
+ouORF <- openxlsx::read.xlsx(PATH_CIPS_OUORF)
+ouORF_genes <- unique(as.character(ouORF$gene_id))
+.pass_ou <- ouORF$Pass_ouORF_criteria %in% c(TRUE, "TRUE")
+.same_start <- ouORF$startcodon_identical_to_nuORF %in% c(TRUE, "TRUE")
+ouORF_ev <- ouORF[.pass_ou & !.same_start, ] %>%
+  dplyr::transmute(gene_id = as.character(gene_id), tx_id = as.character(tx_id), ORF_id, ORF_id2,
+                   InFrameC, TotalC, InFrameS, TotalS, pept_length = as.integer(AA), Strand = as.character(Strand),
+                   InFrameC_perc, InFrameS_perc, peptide_seq = as.character(peptide_seq),
+                   chr = as.character(chr), ORF_gstart = as.integer(ORF_gstart), ORF_gstop = as.integer(ORF_gstop),
+                   uORF_Tx_range = NA_character_, ORF_type = "ouORF")
+if (INCLUDE_OUORF_AS_TUORF) {
+  ouORF_genes_in_evidence <- unique(ouORF_ev$gene_id)
+  CiPS <- dplyr::bind_rows(CiPS, ouORF_ev)
+  message(sprintf("CiPS evidence (INCLUDE_OUORF_AS_TUORF = TRUE): %d nuORF rows + %d ouORF rows (of %d ouORF calls: %d fail the masked criteria, %d share a start codon with a nuORF)",
+                  sum(CiPS$ORF_type == "uORF"), nrow(ouORF_ev), nrow(ouORF), sum(!.pass_ou), sum(.same_start)))
+} else {
+  ouORF_genes_in_evidence <- character(0)   # exclusions only: no ouORF enters the TuORF evidence set
+  message(sprintf("CiPS evidence (INCLUDE_OUORF_AS_TUORF = FALSE): %d nuORF rows; ouORFs (%d calls, %d genes) are used as exclusions and in the prevalence ladder only",
+                  nrow(CiPS), nrow(ouORF), length(ouORF_genes)))
+}
+
+txdb <- .make_txdb(
   file = PATH_GTF, format = "gtf",
   dataSource = "Araport11",
   organism = "Arabidopsis"
@@ -462,6 +623,15 @@ Strand_info <- rbind(
 
 # detected gene set (for uuORF exclusion + Figure4 TE)
 detected_genes <- unique(c(as.character(ORFs_max_filt_uORF$gene_id), as.character(CiPS$gene_id)))
+
+# detected_genes now includes genes whose evidence ORF is an ouORF. Genes with ANY detected
+# upstream translation (nuORF, evidence ouORF, or an ouORF that failed the masked criteria /
+# duplicated a nuORF start) form the exclusion set for every "No TuORF" control and the UuORF
+# candidate set (Reviewer 2 §2.3: unaccounted leader translation).
+upstream_translated_genes   <- unique(c(detected_genes, ouORF_genes))
+ouORF_genes_not_in_evidence <- setdiff(ouORF_genes, ouORF_genes_in_evidence)
+message(sprintf("ouORF genes: %d total | %d with an ouORF in the evidence set | %d with only non-evidence ouORFs (excluded from controls and from the single-upstream-ORF cohort)",
+                length(ouORF_genes), length(ouORF_genes_in_evidence), length(ouORF_genes_not_in_evidence)))
 
 ################################################################################
 # 2) mORF CDS metrics (P-sites / CDS length)
@@ -563,7 +733,9 @@ DF_RT <- DF_RT_meta %>%
     ORF_gstart = as.integer(ifelse(Strand == "+", g_min, g_max)),
     ORF_gstop  = as.integer(ifelse(Strand == "+", g_max, g_min)),
     uORF_length = as.integer(pept_length),
-    uORF_TL = dplyr::if_else(uORF_length_nt > 0, uORF_P_sites / uORF_length_nt, NA_real_)
+    uORF_TL = dplyr::if_else(uORF_length_nt > 0, uORF_P_sites / uORF_length_nt, NA_real_),
+    ORF_type = "uORF",
+    TL_region_nt = as.integer(uORF_length_nt)
   ) %>%
   dplyr::select(
     gene_id, tx_id, Strand,
@@ -571,17 +743,29 @@ DF_RT <- DF_RT_meta %>%
     genome_range,
     ORF_gstart, ORF_gstop,
     uORF_Tx_range,
-    uORF_P_sites, uORF_length, uORF_length_nt,
+    uORF_P_sites, uORF_length, uORF_length_nt, TL_region_nt,
     peptide_seq, uORF_TL,
-    method
+    method, ORF_type
   )
+
+## 5'UTR length per transcript (nt): the translation-level region of an ouORF is the part of the
+## ORF upstream of the CDS start, i.e. 5'UTR length - ORF start (tx coords) + 1.
+.utr5_len_by_tx <- sum(BiocGenerics::width(GenomicFeatures::fiveUTRsByTranscript(txdb, use.names = TRUE)))
 
 DF_CiPS <- CiPS %>%
   dplyr::mutate(
-    uORF_P_sites   = as.numeric(TotalC),
-    uORF_length    = as.integer(pept_length),
+    ORF_type       = ifelse(is.na(ORF_type), "uORF", as.character(ORF_type)),
+    uORF_P_sites   = as.numeric(TotalC),                 # ouORFs: P-sites in the 5'UTR portion only (CDS overlap masked)
+    uORF_length    = as.integer(pept_length),            # full ORF length (aa) for both types
     uORF_length_nt = as.integer(pept_length) * 3L,
-    uORF_TL        = as.numeric(TotalC) / (as.integer(pept_length) * 3L),
+    .tx_start      = suppressWarnings(as.integer(sub("-.*$", "", as.character(uORF_Tx_range)))),
+    .utr5_len      = unname(.utr5_len_by_tx[as.character(tx_id)]),
+    TL_region_nt   = dplyr::case_when(
+      ORF_type == "ouORF" & !is.na(.tx_start) & !is.na(.utr5_len) & .utr5_len >= .tx_start ~ as.integer(.utr5_len - .tx_start + 1L),
+      ORF_type == "ouORF" ~ NA_integer_,                 # start not placeable in the leader -> no TL (dropped from uIF analyses)
+      TRUE ~ as.integer(pept_length) * 3L
+    ),
+    uORF_TL        = dplyr::if_else(!is.na(TL_region_nt) & TL_region_nt > 0, uORF_P_sites / TL_region_nt, NA_real_),
     method         = "CiPS",
     uORF_id_short  = as.character(uORF_id),
     uORF_Tx_range  = as.character(uORF_Tx_range)
@@ -592,10 +776,13 @@ DF_CiPS <- CiPS %>%
     genome_range,
     ORF_gstart, ORF_gstop,
     uORF_Tx_range,
-    uORF_P_sites, uORF_length, uORF_length_nt,
+    uORF_P_sites, uORF_length, uORF_length_nt, TL_region_nt,
     peptide_seq, uORF_TL,
-    method
+    method, ORF_type
   )
+message(sprintf("DF_CiPS: %d uORFs | %d ouORFs with a 5'UTR-portion TL | %d ouORFs without TL (start not placed in the leader)",
+                sum(DF_CiPS$ORF_type == "uORF"), sum(DF_CiPS$ORF_type == "ouORF" & !is.na(DF_CiPS$uORF_TL)),
+                sum(DF_CiPS$ORF_type == "ouORF" & is.na(DF_CiPS$uORF_TL))))
 
 DF_RT2   <- standardize_evidence_types(DF_RT)
 DF_CiPS2 <- standardize_evidence_types(DF_CiPS)
@@ -638,14 +825,8 @@ CAGE_raw$end <- CAGE_raw$start
 CAGE_raw$chr <- gsub("^chr|^Chr", "", CAGE_raw$chr, ignore.case = TRUE)
 CAGE_gr <- GenomicRanges::makeGRangesFromDataFrame(CAGE_raw, keep.extra.columns = TRUE)
 
-all_tx <- GenomicFeatures::transcripts(txdb, use.names = TRUE)
-tss_windows <- all_tx[names(all_tx) %in% mORF_uORF_Info$tx_id]
-
-# strand-aware window: upstream 100 + downstream full transcript
-tss_windows <- suppressWarnings(GenomicRanges::promoters(
-  tss_windows, upstream = 100, downstream = BiocGenerics::width(tss_windows)
-))
-tss_windows <- GenomicRanges::trim(tss_windows)
+# TSS-counting windows: shared definition (see .make_tss_windows in 0e; the A1 window fix lives there)
+tss_windows <- .make_tss_windows(txdb, mORF_uORF_Info$tx_id)
 
 # try to align seqlevels styles
 try({
@@ -761,6 +942,14 @@ TE_tbl <- data.frame(
 
 gene_counts <- table(OUT_df5_clean$gene_id)
 single_uorf_genes <- names(gene_counts)[gene_counts == 1]
+# gene_counts counts nuORFs AND evidence ouORFs, so "single" = exactly one detected upstream ORF of
+# either type. Genes with an ouORF that is NOT in the evidence set (failed the masked criteria or
+# duplicated a nuORF start) still carry unaccounted upstream translation and are removed as well.
+.n_single_before_ou <- length(single_uorf_genes)
+single_uorf_genes <- setdiff(single_uorf_genes, ouORF_genes_not_in_evidence)
+message(sprintf("single-upstream-ORF genes: %d -> %d after removing %d genes with a non-evidence ouORF; %d of the remaining have an ouORF as their single upstream ORF",
+                .n_single_before_ou, length(single_uorf_genes), .n_single_before_ou - length(single_uorf_genes),
+                dplyr::n_distinct(OUT_df5_clean$gene_id[OUT_df5_clean$gene_id %in% single_uorf_genes & OUT_df5_clean$ORF_type == "ouORF"])))
 
 OUT_df6 <- dplyr::left_join(OUT_df5_clean, TE_tbl, by = "gene_id") %>%
   dplyr::filter(pUP > 0) %>%
@@ -780,9 +969,9 @@ OUT_df6 <- dplyr::left_join(OUT_df5_clean, TE_tbl, by = "gene_id") %>%
 TableS2 <- OUT_df6 %>%
   dplyr::mutate(
     uIF_Group = dplyr::case_when(          # same cutoffs as Figures 1E/2C
-      uIF > 1   ~ "Strong (uIF > 1)",
+      uIF > 1   ~ "High (uIF > 1)",
       uIF > 0.2 ~ "Medium (0.2 < uIF <= 1)",
-      TRUE      ~ "Weak (uIF <= 0.2)"
+      TRUE      ~ "Low (uIF <= 0.2)"
     ),
     pUP_Group = dplyr::case_when(
       pUP >= 80 ~ "80~100",
@@ -802,6 +991,8 @@ TableS2 <- OUT_df6 %>%
     uORF_length_nt,
     peptide_seq,
     detection_method   = method,
+    ORF_type,
+    TL_region_nt,
     uORF_P_sites,
     uORF_TL,
     mORF_P_sites       = mORF_Ribo_count,
@@ -819,7 +1010,7 @@ stopifnot(nrow(TableS2) == dplyr::n_distinct(TableS2$gene_id))  # one row per ge
 TableS2_legend <- data.frame(
   Column = c("gene_id", "tx_id", "chr", "Strand", "uORF_genome_range",
              "uORF_start_genomic", "uORF_stop_genomic", "uORF_Tx_range",
-             "uORF_length_aa", "uORF_length_nt", "peptide_seq", "detection_method",
+             "uORF_length_aa", "uORF_length_nt", "peptide_seq", "detection_method", "ORF_type", "TL_region_nt",
              "uORF_P_sites", "uORF_TL", "mORF_P_sites", "mORF_length_nt", "mORF_TL",
              "uIF", "uIF_Group", "pct_uORF_plus", "pUP_Group",
              "RNA_TPM", "Ribo_TPM", "mORF_TE"),
@@ -836,13 +1027,15 @@ TableS2_legend <- data.frame(
     "TuORF length (nucleotides)",
     "Predicted TuORF peptide sequence",
     "Method that identified the TuORF (RiboTaper, CiPS, or Both)",
+    ifelse(INCLUDE_OUORF_AS_TUORF, "uORF = non-overlapping uORF (stop codon within the 5' leader); ouORF = overlapping uORF (CiPS; start in the leader, stop inside the CDS; included as TuORF in this run)", "uORF = non-overlapping uORF (stop codon within the 5' leader); overlapping uORFs (start in the leader, stop inside the CDS) are not treated as TuORFs in this run and are absent from this table (Methods)"),
+    "Length (nt) of the region used for uORF_TL: the coding length of the uORF (equal to uORF_length_nt for non-overlapping uORFs; for overlapping uORFs, when included, the ORF nucleotides upstream of the CDS start)",
     "Ribo-seq P-site count within the TuORF",
     "TuORF translation level: P-sites / TuORF length (nt)",
     "Ribo-seq P-site count within the mORF CDS",
     "mORF CDS length (nucleotides)",
     "mORF translation level: P-sites / CDS length (nt)",
-    "uORF Impact Factor: uORF_TL / mORF_TL (rounded to 3 decimals)",
-    "uIF group as in Figure 1: Strong (uIF > 1), Medium (0.2 < uIF <= 1), Weak (uIF <= 0.2)",
+    "uORF intensity factor (relative ribosome occupancy): uORF_TL / mORF_TL (rounded to 3 decimals)",
+    "uIF class as in Figure 1: High (uIF > 1), Medium (0.2 < uIF <= 1), Low (uIF <= 0.2)",
     paste0("%uORF+ (percentage of transcripts including the uORF) based on ",
            ifelse(TSS_SOURCE == "CAGE", "CAGE-seq", "TSS-seq (Nielsen et al. 2019)")),
     "%uORF+ category (0~30, 30~80, 80~100)",
@@ -864,11 +1057,11 @@ openxlsx::setColWidths(wb_s2, "Table S2", cols = seq_len(ncol(TableS2)), widths 
 openxlsx::setColWidths(wb_s2, "Column legend", cols = 1:2, widths = c(24, 90))
 openxlsx::saveWorkbook(wb_s2, file.path(OUT_DIR, "Table_S2_single_TuORF_genes.xlsx"), overwrite = TRUE)
 
-message(sprintf("✓ Saved Table_S2_single_TuORF_genes.xlsx  (%d single-TuORF genes; %d Strong / %d Medium / %d Weak)",
+message(sprintf("✓ Saved Table_S2_single_TuORF_genes.xlsx  (%d single-TuORF genes; %d high / %d medium / %d low uIF)",
                 nrow(TableS2),
-                sum(TableS2$uIF_Group == "Strong (uIF > 1)"),
+                sum(TableS2$uIF_Group == "High (uIF > 1)"),
                 sum(TableS2$uIF_Group == "Medium (0.2 < uIF <= 1)"),
-                sum(TableS2$uIF_Group == "Weak (uIF <= 0.2)")))
+                sum(TableS2$uIF_Group == "Low (uIF <= 0.2)")))
 
 ################################################################################
 # TABLE S1 EXPORT — all TuORFs
@@ -954,6 +1147,8 @@ TableS1_base <- OUT_df5_clean %>%
       uORF_length_nt,
       peptide_seq,
       detection_method   = method,
+      ORF_type,
+      TL_region_nt,
       n_TuORFs_in_gene,
       uORF_P_sites,
       uORF_TL,
@@ -975,7 +1170,7 @@ stopifnot(nrow(TableS1A) == nrow(OUT_df5_clean), nrow(TableS1B) == nrow(TableS1A
 TableS1_legend <- data.frame(
   Column = c("gene_id", "tx_id", "chr", "Strand", "uORF_genome_range",
              "uORF_start_genomic", "uORF_stop_genomic", "uORF_Tx_range",
-             "uORF_length_aa", "uORF_length_nt", "peptide_seq", "detection_method",
+             "uORF_length_aa", "uORF_length_nt", "peptide_seq", "detection_method", "ORF_type", "TL_region_nt",
              "n_TuORFs_in_gene", "uORF_P_sites", "uORF_TL", "mORF_P_sites",
              "mORF_length_nt", "mORF_TL", "uIF", "pct_uORF_plus", "pUP_Group",
              "RNA_TPM", "Ribo_TPM", "mORF_TE"),
@@ -992,13 +1187,15 @@ TableS1_legend <- data.frame(
     "TuORF length (nucleotides)",
     "Predicted TuORF peptide sequence",
     "Method that identified the TuORF (RiboTaper, CiPS, or Both)",
+    ifelse(INCLUDE_OUORF_AS_TUORF, "uORF = non-overlapping uORF (stop codon within the 5' leader); ouORF = overlapping uORF (CiPS; start in the leader, stop inside the CDS; included as TuORF in this run)", "uORF = non-overlapping uORF (stop codon within the 5' leader); overlapping uORFs (start in the leader, stop inside the CDS) are not treated as TuORFs in this run and are absent from this table (Methods)"),
+    "Length (nt) of the region used for uORF_TL: the coding length of the uORF (equal to uORF_length_nt for non-overlapping uORFs; for overlapping uORFs, when included, the ORF nucleotides upstream of the CDS start)",
     "Number of unique TuORFs in this gene (this table lists each on its own row)",
     "Ribo-seq P-site count within the TuORF",
     "TuORF translation level: P-sites / TuORF length (nt)",
     "Ribo-seq P-site count within the mORF CDS",
     "mORF CDS length (nucleotides)",
     "mORF translation level: P-sites / CDS length (nt)",
-    "uORF Impact Factor: uORF_TL / mORF_TL (rounded to 3 decimals)",
+    "uORF intensity factor (relative ribosome occupancy): uORF_TL / mORF_TL (rounded to 3 decimals)",
     "%uORF+ (percentage of transcripts including the uORF); sheet S1A = CAGE-seq, sheet S1B = TSS-seq (Nielsen et al. 2019)",
     "%uORF+ category (0~30, 30~80, 80~100)",
     "mRNA abundance (RSEM TPM, RNA-seq); NA if the gene is not in the TE analysis set (5'UTR-containing, RNA TPM > 1)",
@@ -1053,7 +1250,7 @@ pD <- ggplot2::ggplot(OUT_df6_log2_both, ggplot2::aes(x = log2(uIF_raw), y = log
   ggplot2::theme(plot.title = ggplot2::element_text(face = "bold", size = 16))
 
 TE_NoTuORF <- TE_tbl %>%
-  dplyr::filter(!(gene_id %in% unique(OUT_df5_clean$gene_id))) %>%
+  dplyr::filter(!(gene_id %in% upstream_translated_genes)) %>%   # no TuORF AND no ouORF
   dplyr::transmute(gene_id, TE, Group_Label = "No TuORF")
 
 PlotE_Data <- dplyr::bind_rows(
@@ -1061,9 +1258,9 @@ PlotE_Data <- dplyr::bind_rows(
     dplyr::transmute(
       gene_id, TE,
       Group_Label = dplyr::case_when(
-        uIF > 1   ~ "Strong uORF (>1)",
-        uIF > 0.2 ~ "Mid uORF (>0.2 - 1)",
-        TRUE      ~ "Weak uORF (0 - 0.2)"
+        uIF > 1   ~ "High uIF (>1)",
+        uIF > 0.2 ~ "Medium uIF (0.2-1)",
+        TRUE      ~ "Low uIF (<=0.2)"
       )
     ),
   TE_NoTuORF
@@ -1071,7 +1268,7 @@ PlotE_Data <- dplyr::bind_rows(
 
 PlotE_Data$Group_Label <- factor(
   PlotE_Data$Group_Label,
-  levels = c("Strong uORF (>1)", "Mid uORF (>0.2 - 1)", "Weak uORF (0 - 0.2)", "No TuORF")
+  levels = c("High uIF (>1)", "Medium uIF (0.2-1)", "Low uIF (<=0.2)", "No TuORF")
 )
 
 statsE <- generate_legend_labels(PlotE_Data, "Group_Label", "TE")
@@ -1112,9 +1309,9 @@ save_pdf(Figure1_CDE, "Figure1_CDE.pdf", w = 10, h = 10)
 df_main <- OUT_df6 %>%
   dplyr::mutate(
     uIF_Group = dplyr::case_when(
-      uIF > 1   ~ "Strong uORF (>1)",
-      uIF > 0.2 ~ "Mid uORF (>0.2 - 1)",
-      TRUE      ~ "Weak uORF (0 - 0.2)"
+      uIF > 1   ~ "High uIF (>1)",
+      uIF > 0.2 ~ "Medium uIF (0.2-1)",
+      TRUE      ~ "Low uIF (<=0.2)"
     ),
     pUP_Group = dplyr::case_when(
       pUP >= 80 ~ "80~100",
@@ -1123,7 +1320,7 @@ df_main <- OUT_df6 %>%
     )
   )
 df_main$uIF_Group <- factor(df_main$uIF_Group,
-                            levels = c("Strong uORF (>1)", "Mid uORF (>0.2 - 1)", "Weak uORF (0 - 0.2)"))
+                            levels = c("High uIF (>1)", "Medium uIF (0.2-1)", "Low uIF (<=0.2)"))
 df_main$pUP_Group <- factor(df_main$pUP_Group, levels = c("80~100", "30~80", "0~30"))
 
 # TE for "No TuORF"
@@ -1149,7 +1346,7 @@ p3B <- ggplot2::ggplot(df_main, ggplot2::aes(x = pUP)) +
   ggplot2::annotate("text", x = 55, y = Inf, label = label_mid,  vjust = 1.2, size = 3.5) +
   ggplot2::annotate("text", x = 90, y = Inf, label = label_high, vjust = 1.2, size = 3.5) +
   ggplot2::theme_classic() +
-  ggplot2::labs(title = "B", x = "%pUP (CAGE)", y = "Number of genes") +
+  ggplot2::labs(title = "B", x = "%uORF+ (CAGE)", y = "Number of genes") +
   ggplot2::theme(plot.title = ggplot2::element_text(face = "bold", size = 16))
 
 # C: ECDF pUP by uIF group (legend letters)
@@ -1164,7 +1361,7 @@ p3C <- ggplot2::ggplot(df_main_3C, ggplot2::aes(x = pUP, color = Final_Label)) +
   ggplot2::stat_ecdf(geom = "step", size = 1.2) +
   ggplot2::scale_color_manual(values = cols_3C) +
   ggplot2::theme_classic() +
-  ggplot2::labs(title = "C", x = "%pUP (CAGE)", y = "Fraction", color = "") +
+  ggplot2::labs(title = "C", x = "%uORF+ (CAGE)", y = "Fraction", color = "") +
   ggplot2::theme(plot.title = ggplot2::element_text(face = "bold", size = 16),
                  legend.position = c(0.70, 0.4),
                  legend.background = ggplot2::element_blank())
@@ -1175,7 +1372,7 @@ p3D <- ggplot2::ggplot(df_main, ggplot2::aes(x = pUP, y = log2(uIF_raw))) +
   ggplot2::geom_smooth(method = "lm", color = "red", size = 1, se = FALSE) +
   ggpubr::stat_cor(method = "pearson", label.x.npc = "left", label.y.npc = "top") +
   ggplot2::theme_classic() +
-  ggplot2::labs(title = "D", x = "%pUP (CAGE)", y = bquote(log[2]~"(uIF)")) +
+  ggplot2::labs(title = "D", x = "%uORF+ (CAGE)", y = bquote(log[2]~"(uIF)")) +
   ggplot2::theme(plot.title = ggplot2::element_text(face = "bold", size = 16))
 
 # E: pUP vs log2(TE)
@@ -1184,11 +1381,11 @@ p3E <- ggplot2::ggplot(df_main %>% dplyr::filter(is.finite(TE), TE > 0), ggplot2
   ggplot2::geom_smooth(method = "lm", color = "red", size = 1, se = FALSE) +
   ggpubr::stat_cor(method = "pearson", label.x.npc = "left", label.y.npc = "top") +
   ggplot2::theme_classic() +
-  ggplot2::labs(title = "E", x = "%pUP (CAGE)", y = bquote(log[2]~"(mORF TE)")) +
+  ggplot2::labs(title = "E", x = "%uORF+ (CAGE)", y = bquote(log[2]~"(mORF TE)")) +
   ggplot2::theme(plot.title = ggplot2::element_text(face = "bold", size = 16))
 
 # F: TE ECDF by pUP bins + No TuORF (legend letters)
-stats_3F <- generate_legend_labels(df_3F, "pUP_Group", "TE")
+stats_3F <- generate_legend_labels(df_3F %>% dplyr::filter(is.finite(TE)), "pUP_Group", "TE")   # n in the key = genes with TE data, i.e. the genes drawn (as Figure S9E; 2026-11-01)
 df_3F_plot <- df_3F %>% dplyr::left_join(stats_3F %>% dplyr::select(pUP_Group, Final_Label), by = "pUP_Group")
 ordered_3F <- unique(stats_3F$Final_Label[order(match(stats_3F$pUP_Group, levels(df_3F$pUP_Group)))])
 df_3F_plot$Final_Label <- factor(df_3F_plot$Final_Label, levels = ordered_3F)
@@ -1238,8 +1435,11 @@ df_cds_coords <- as.data.frame(cds_flat) %>%
 
 all_tx_m <- GenomicFeatures::transcripts(txdb, use.names=TRUE)
 all_tx_m <- all_tx_m[names(all_tx_m) %in% target_mORF_tx$tx_id]
-tss_windows_m <- suppressWarnings(GenomicRanges::promoters(all_tx_m, upstream = 100, downstream = BiocGenerics::width(all_tx_m)))
-tss_windows_m <- GenomicRanges::trim(tss_windows_m)
+## %mORF+ keeps the FULL-transcript window on purpose: it asks what share of ALL capped
+## 5' ends of the gene (incl. CDS-internal TSSs) lie upstream of the CDS start. With the
+## 5'UTR window used for %uORF+ it would be 100% by construction. NOTE (R2 §2.4): panel G
+## therefore compares %uORF+ (utr5 window) with %mORF+ (full_tx window) — revisit Fig S4.
+tss_windows_m <- .make_tss_windows(txdb, names(all_tx_m), mode = "full_tx")
 
 overlaps_m <- GenomicRanges::findOverlaps(CAGE_gr, tss_windows_m)
 dt_cage_m <- data.table::data.table(
@@ -1309,16 +1509,16 @@ get_morf_label <- function(grp_name) {
 
 label_low_m  <- get_morf_label("0~30")
 label_mid_m  <- get_morf_label("30~80")
-label_high_m <- get_morf_label("80~100")
+label_high_m <- get_morf_label("80~100"); .hmax_m <- max(graphics::hist(OUT_pUP_mORF$pUP[is.finite(OUT_pUP_mORF$pUP)], breaks = seq(-1, 101, 2), plot = FALSE)$counts) * 1.03   # top of the tallest bar
 
 p3H <- ggplot2::ggplot(OUT_pUP_mORF, ggplot2::aes(x = pUP)) +
   ggplot2::geom_histogram(binwidth = 2, fill = "#3498db", color = "white", size = 0.1) +
-  ggplot2::geom_vline(xintercept = c(30, 80), color = "black", size = 0.5) +
+  ggplot2::annotate("segment", x = c(30, 80), xend = c(30, 80), y = 0, yend = .hmax_m, color = "black", linewidth = 0.5) + ggplot2::scale_y_continuous(expand = ggplot2::expansion(mult = c(0.02, 0.32))) +   # lines stop below the labels (2026-10-30)
   ggplot2::annotate("text", x = 15, y = Inf, label = label_low_m,  vjust = 1.2, size = 3.5) +
   ggplot2::annotate("text", x = 55, y = Inf, label = label_mid_m,  vjust = 1.2, size = 3.5) +
   ggplot2::annotate("text", x = 90, y = Inf, label = label_high_m, vjust = 1.2, size = 3.5) +
   ggplot2::theme_classic() +
-  ggplot2::labs(title = "H", x = "% mORF pUP (CAGE)", y = "Number of genes") +
+  ggplot2::labs(title = "H", x = "% of transcripts containing the mORF start codon (CAGE)", y = "Number of genes") +
   ggplot2::theme(plot.title = ggplot2::element_text(face = "bold", size = 16))
 
 Final_Fig3 <- ggpubr::ggarrange(
@@ -1354,9 +1554,9 @@ df_hl_uorf <- dplyr::left_join(OUT_df6, hl_df, by = "gene_id") %>%
 df_hl_uorf <- df_hl_uorf %>%
   dplyr::mutate(
     uIF_cat = dplyr::case_when(
-      uIF > 1 ~ "Strong (>1)",
-      uIF > 0.2 ~ "Mid (>0.2 - 1)",
-      TRUE ~ "Weak (0 - 0.2)"
+      uIF > 1 ~ "High (>1)",
+      uIF > 0.2 ~ "Medium (0.2-1)",
+      TRUE ~ "Low (<=0.2)"
     ),
     pUP_cat = dplyr::case_when(
       pUP >= 80 ~ "80~100",
@@ -1364,7 +1564,7 @@ df_hl_uorf <- df_hl_uorf %>%
       TRUE ~ "0~30"
     )
   )
-df_hl_uorf$uIF_cat <- factor(df_hl_uorf$uIF_cat, levels = c("Weak (0 - 0.2)", "Mid (>0.2 - 1)", "Strong (>1)"))
+df_hl_uorf$uIF_cat <- factor(df_hl_uorf$uIF_cat, levels = c("Low (<=0.2)", "Medium (0.2-1)", "High (>1)"))
 df_hl_uorf$pUP_cat <- factor(df_hl_uorf$pUP_cat, levels = c("0~30", "30~80", "80~100"))
 
 # Other genes: half-lives for genes not in uORF genes
@@ -1398,7 +1598,7 @@ df_2a_all <- dplyr::bind_rows(
   df_hl_uorf %>% dplyr::select(gene_id, half_life, Group = uIF_cat),
   df_hl_other %>% dplyr::select(gene_id, half_life, Group = uIF_cat)
 )
-df_2a_all$Group <- factor(df_2a_all$Group, levels = c("Weak (0 - 0.2)", "Mid (>0.2 - 1)", "Strong (>1)", "Other genes"))
+df_2a_all$Group <- factor(df_2a_all$Group, levels = c("Low (<=0.2)", "Medium (0.2-1)", "High (>1)", "Other genes"))
 
 stats_2a <- generate_legend_labels(df_2a_all, "Group", "half_life")
 df_2a <- df_2a_all %>% dplyr::left_join(stats_2a %>% dplyr::select(Group, Final_Label), by = "Group")
@@ -1440,9 +1640,9 @@ df_scatter <- OUT_df6 %>%
     log_uIF = log2(uIF),
     log_pUP = log2(pUP),
     uIF_cat = dplyr::case_when(
-      uIF > 1 ~ "Strong (>1)",
-      uIF > 0.2 ~ "Mid (>0.2 - 1)",
-      TRUE ~ "Weak (0 - 0.2)"
+      uIF > 1 ~ "High (>1)",
+      uIF > 0.2 ~ "Medium (0.2-1)",
+      TRUE ~ "Low (<=0.2)"
     ),
     pUP_cat = dplyr::case_when(
       pUP >= 80 ~ "80~100",
@@ -1450,7 +1650,7 @@ df_scatter <- OUT_df6 %>%
       TRUE ~ "0~30"
     )
   )
-df_scatter$uIF_cat <- factor(df_scatter$uIF_cat, levels = c("Weak (0 - 0.2)", "Mid (>0.2 - 1)", "Strong (>1)"))
+df_scatter$uIF_cat <- factor(df_scatter$uIF_cat, levels = c("Low (<=0.2)", "Medium (0.2-1)", "High (>1)"))
 df_scatter$pUP_cat <- factor(df_scatter$pUP_cat, levels = c("0~30", "30~80", "80~100"))
 
 # Compute correlations per group
@@ -1540,7 +1740,7 @@ message("Figure 4 will use PATH_GTF2: ", PATH_GTF2)
 # ------------------------------------------------------------------------------
 # 1) Dedicated TxDb for Figure 4 from PATH_GTF2 (do NOT reuse txdb)
 # ------------------------------------------------------------------------------
-txdb_uu_4 <- GenomicFeatures::makeTxDbFromGFF(
+txdb_uu_4 <- .make_txdb(
   file = PATH_GTF2, format = "gtf",
   dataSource = "Araport11",
   organism = "Arabidopsis"
@@ -1579,7 +1779,7 @@ if (length(utr_lv_4) > 0 && length(fa_levels_4) > 0) {
 fiveUTR_seqs_all_4 <- GenomicFeatures::extractTranscriptSeqs(FA_UU_4, fiveUTRByTx_all_4)
 
 utr_gene_ids_4 <- substr(names(fiveUTR_seqs_all_4), 1, 9)
-keep_mask_4 <- !(utr_gene_ids_4 %in% detected_genes)
+keep_mask_4 <- !(utr_gene_ids_4 %in% upstream_translated_genes)   # UuORF candidates: no detected TuORF and no detected ouORF
 
 fiveUTRByTx_uu_4  <- fiveUTRByTx_all_4[keep_mask_4]
 fiveUTR_seqs_uu_4 <- fiveUTR_seqs_all_4[keep_mask_4]
@@ -1926,7 +2126,7 @@ p4D_4 <- ggplot2::ggplot(UuORF_gene_df_4, ggplot2::aes(x = pUP)) +
   ggplot2::scale_x_continuous(breaks = seq(0, 100, by = 20), limits = c(0, 100)) +
   ggplot2::coord_cartesian(ylim = c(0, 600)) +
   ggplot2::theme_classic() +
-  ggplot2::labs(title = "D", x = "%pUP (CAGE)", y = "Number of genes") +
+  ggplot2::labs(title = "D", x = "%uORF+ (CAGE)", y = "Number of genes") +
   ggplot2::theme(plot.title = ggplot2::element_text(face = "bold", size = 16))
 
 # ------------------------------------------------------------------------------
@@ -1969,7 +2169,7 @@ TE_Detected_4 <- TE_tbl_0p1_4 %>% dplyr::filter(gene_id %in% detected_genes) %>%
 TE_0_30_4     <- TE_tbl_0p1_4 %>% dplyr::filter(gene_id %in% uu_0_30_4)       %>% dplyr::mutate(Group = "0~30")
 TE_30_80_4    <- TE_tbl_0p1_4 %>% dplyr::filter(gene_id %in% uu_30_80_4)      %>% dplyr::mutate(Group = "30~80")
 TE_80_100_4   <- TE_tbl_0p1_4 %>% dplyr::filter(gene_id %in% uu_80_100_4)     %>% dplyr::mutate(Group = "80~100")
-TE_Other_4    <- TE_tbl_0p1_4 %>% dplyr::filter(!gene_id %in% c(UuORF_gene_df_4$gene_id, detected_genes)) %>% dplyr::mutate(Group = "Other")
+TE_Other_4    <- TE_tbl_0p1_4 %>% dplyr::filter(!gene_id %in% c(UuORF_gene_df_4$gene_id, upstream_translated_genes)) %>% dplyr::mutate(Group = "Other")
 
 group_order4_4 <- c("Detected uORFs", "0~30", "30~80", "80~100", "Other")
 TE_Uu_Final_4 <- dplyr::bind_rows(TE_Detected_4, TE_0_30_4, TE_30_80_4, TE_80_100_4, TE_Other_4) %>%
@@ -2106,7 +2306,7 @@ Plot_Data_uORF <- dplyr::inner_join(df_uorf_one %>% dplyr::select(gene_id, ORF_G
 Plot_Data_uORF$ORF_Group <- factor(Plot_Data_uORF$ORF_Group, levels = c("CPuORF", "TuORF"))
 
 Plot_Data_NoTuORF <- TE_tbl %>%
-  dplyr::filter(!(gene_id %in% unique(Plot_Data_uORF$gene_id))) %>%
+  dplyr::filter(!(gene_id %in% c(unique(Plot_Data_uORF$gene_id), upstream_translated_genes))) %>%   # no TuORF AND no ouORF
   dplyr::transmute(gene_id, TE, ORF_Group = "No TuORF")
 
 Plot_Data_All <- dplyr::bind_rows(
@@ -2134,7 +2334,7 @@ p5D <- ggplot2::ggplot(Data_5D, ggplot2::aes(x=pUP, color=Final_Label)) +
   ggplot2::scale_color_manual(values=cols_5D) +
   ggplot2::coord_cartesian(xlim=c(0,100)) +
   theme_clean +
-  ggplot2::labs(title="D", x="% pUP (CAGE)", y="Fraction", color="") +
+  ggplot2::labs(title="D", x="%uORF+ (CAGE)", y="Fraction", color="") +
   ggplot2::theme(legend.position=c(0.7,0.3), legend.background=ggplot2::element_blank())
 
 # E: ECDF UI (CPuORF vs TuORF) with letters in legend
@@ -2151,7 +2351,7 @@ p5E <- ggplot2::ggplot(Data_5E, ggplot2::aes(x=UI, color=Final_Label)) +
   ggplot2::scale_color_manual(values=cols_5E) +
   ggplot2::coord_cartesian(xlim=c(0,20)) +
   theme_clean +
-  ggplot2::labs(title="E", x="UI (uIF)", y="Fraction", color="") +
+  ggplot2::labs(title="E", x="uIF", y="Fraction", color="") +
   ggplot2::theme(legend.position=c(0.7,0.3), legend.background=ggplot2::element_blank())
 
 # F: ECDF TE (CPuORF/TuORF/NoTuORF) with letters in legend
@@ -2547,6 +2747,15 @@ run_threshold_analysis <- function(threshold_val, dt_source, seqs_source, uorf_g
 # ------------------------------------------------------------------------------
 # 6.2 RUN 50% (AB + seqlogos) AND 30/80% (seqlogos only)
 # ------------------------------------------------------------------------------
+# The plotted "TuORF" group is the single-TuORF analysis set (uORF_gene_ids = OUT_df6 genes; design
+# choice above). The "No TuORF" side must then be free of ANY detected upstream translation, so every
+# gene with a TuORF outside that set (multi-TuORF genes, TuORF genes failing the TE/%uORF+ filters) or
+# with a detected ouORF is removed from the universe here (added 2026-10-27; before, those genes sat
+# in the "No TuORF" group).
+drop_genes_6 <- setdiff(toupper(upstream_translated_genes), toupper(uORF_gene_ids))
+dt_raw <- dt_raw[!(toupper(substr(tx_name, 1, 9)) %in% drop_genes_6)]
+message(sprintf("Figure 6: %d genes with detected upstream translation outside the plotted TuORF group removed from the No-TuORF side", length(drop_genes_6)))
+
 res_50 <- run_threshold_analysis(
   threshold_val = 0.50,
   dt_source = dt_raw,
@@ -2637,7 +2846,7 @@ plot_data_7_1 <- raw_dla_1 %>%
     cols = -c(Repeat, Lines),
     names_to = "Gene",
     values_to = "Expression"
-  )
+  ) %>% dplyr::filter(Gene != "LTP2") %>% dplyr::mutate(Gene = sub("^LU14X$", "UL14X", Gene))   # LTP2 is not part of the manuscript (Larry, 2026-11-01); UL14X spelled as in the text
 
 comparison_list_7 <- list(c("WT", "Mut"))
 
@@ -2685,7 +2894,7 @@ plot_data_7_2 <- raw_qpcr_1 %>%
     cols = -c(Repeat, Lines, tech_repeat),
     names_to = "Gene",
     values_to = "Expression"
-  )
+  ) %>% dplyr::filter(Gene != "LTP2") %>% dplyr::mutate(Gene = sub("^LU14X$", "UL14X", Gene))   # LTP2 is not part of the manuscript (Larry, 2026-11-01); UL14X spelled as in the text
 
 p7_2 <- ggplot2::ggplot(plot_data_7_2, ggplot2::aes(x = Lines, y = Expression, fill = Lines)) +
   ggplot2::geom_boxplot(outlier.shape = NA, alpha = 0.7) +
@@ -2723,14 +2932,14 @@ raw_dla_2 <- openxlsx::read.xlsx(PATH_DLA_WEAK_UORF_UUORF, sheet = 2)
 plot_data_7_3 <- raw_dla_2 %>%
   dplyr::rename(Lines = Plasmids) %>%
   dplyr::mutate(Repeat = as.factor(Repeat)) %>%
-  dplyr::mutate(Lines = factor(Lines, levels = c("WT", "GK"))) %>%
+  dplyr::mutate(Lines = factor(Lines, levels = c("WT", "GK"), labels = c("WT", "Kozak"))) %>%   # the construct with the optimized Kozak context (2026-11-01)
   tidyr::pivot_longer(
     cols = -c(Repeat, Lines),
     names_to = "Gene",
     values_to = "Expression"
   )
 
-comparison_list_7_3 <- list(c("WT", "GK"))
+comparison_list_7_3 <- list(c("WT", "Kozak"))
 
 p7_3 <- ggplot2::ggplot(plot_data_7_3, ggplot2::aes(x = Lines, y = Expression, fill = Lines)) +
   ggplot2::geom_boxplot(outlier.shape = NA, alpha = 0.7) +
@@ -2743,7 +2952,7 @@ p7_3 <- ggplot2::ggplot(plot_data_7_3, ggplot2::aes(x = Lines, y = Expression, f
     hide.ns = FALSE,
     vjust = 0.5
   ) +
-  ggplot2::scale_fill_manual(values = c("WT" = "#888888", "GK" = "#009E73")) +
+  ggplot2::scale_fill_manual(values = c("WT" = "#888888", "Kozak" = "#009E73")) +
   ggplot2::theme_bw() +
   ggplot2::labs(
     title = "DLA Assay Analysis (Perfect Kozak, Sheet 2)",
@@ -2767,14 +2976,14 @@ raw_qpcr_2 <- openxlsx::read.xlsx(PATH_QPCR_PERFECT_KOZAK)
 
 plot_data_7_4 <- raw_qpcr_2 %>%
   dplyr::mutate(Repeat = as.factor(Repeat)) %>%
-  dplyr::mutate(Lines = factor(Lines, levels = c("WT", "KK"))) %>%
+  dplyr::mutate(Lines = factor(Lines, levels = c("WT", "KK"), labels = c("WT", "Kozak"))) %>%   # the construct with the optimized Kozak context (2026-11-01)
   tidyr::pivot_longer(
     cols = -c(Repeat, Lines, tech_repeat),
     names_to = "Gene",
     values_to = "Expression"
   )
 
-comparison_list_7_4 <- list(c("WT", "KK"))
+comparison_list_7_4 <- list(c("WT", "Kozak"))
 
 p7_4 <- ggplot2::ggplot(plot_data_7_4, ggplot2::aes(x = Lines, y = Expression, fill = Lines)) +
   ggplot2::geom_boxplot(outlier.shape = NA, alpha = 0.7) +
@@ -2787,7 +2996,7 @@ p7_4 <- ggplot2::ggplot(plot_data_7_4, ggplot2::aes(x = Lines, y = Expression, f
     hide.ns = FALSE,
     vjust = 0.5
   ) +
-  ggplot2::scale_fill_manual(values = c("WT" = "#888888", "KK" = "#D55E00")) +
+  ggplot2::scale_fill_manual(values = c("WT" = "#888888", "Kozak" = "#D55E00")) +
   ggplot2::theme_bw() +
   ggplot2::labs(
     title = "qPCR Expression Analysis: Perfect Kozak",
@@ -2824,14 +3033,14 @@ message("FIGURE 8: starting...")
 if (!exists("TE_NoTuORF")) {
   if (exists("TE_tbl") && exists("OUT_df5_clean")) {
     TE_NoTuORF <- TE_tbl %>%
-      dplyr::filter(!(gene_id %in% unique(OUT_df5_clean$gene_id))) %>%
+      dplyr::filter(!(gene_id %in% upstream_translated_genes)) %>%   # no TuORF AND no ouORF
       dplyr::transmute(gene_id, TE, Group_Label = "No TuORF")
   } else {
     stop("Figure8 needs TE_NoTuORF or (TE_tbl + OUT_df5_clean) to build it.")
   }
 }
 
-# Use TE_NoTuORF as the "No uORF" reference expected by the Figure 8 code
+# Use TE_NoTuORF as the "No TuORF" reference expected by the Figure 8 code
 TE_CDS_Other <- TE_NoTuORF %>% dplyr::select(gene_id, TE)
 
 # Sanity
@@ -2847,7 +3056,7 @@ df_no_uorf <- TE_CDS_Other %>%
   dplyr::select(gene_id, TE) %>%
   dplyr::mutate(
     uORF_length = NA_real_,
-    Length_Bin  = "No uORF",
+    Length_Bin  = "No TuORF",
     pUP         = NA_real_,
     uIF         = NA_real_,
     log2_uIF    = NA_real_
@@ -2855,6 +3064,7 @@ df_no_uorf <- TE_CDS_Other %>%
 
 # uORF genes
 df_uorf <- OUT_df6 %>%
+  dplyr::filter(ORF_type == "uORF") %>%   # length-dependent (reinitiation) analyses: non-overlapping uORFs only; ouORFs excluded
   dplyr::filter(!is.na(uORF_length), uORF_length >= 1) %>%
   dplyr::mutate(
     Length_Bin = dplyr::case_when(
@@ -2873,9 +3083,9 @@ level_order_uorf <- c("1", "2-10", "11-20", "21-30", ">30")
 create_fig8_violinbox <- function(data_df, x_col, y_col, plot_title, color_pal, y_limit = NULL) {
   
   data_df[[x_col]] <- as.character(data_df[[x_col]])
-  has_no_uorf <- any(data_df[[x_col]] == "No uORF", na.rm = TRUE)
+  has_no_uorf <- any(data_df[[x_col]] == "No TuORF", na.rm = TRUE)
   
-  level_order <- if (has_no_uorf) c("No uORF", level_order_uorf) else level_order_uorf
+  level_order <- if (has_no_uorf) c("No TuORF", level_order_uorf) else level_order_uorf
   data_df[[x_col]] <- factor(data_df[[x_col]], levels = level_order)
   
   data_df <- data_df %>%
@@ -2929,9 +3139,9 @@ create_fig8_violinbox <- function(data_df, x_col, y_col, plot_title, color_pal, 
   
   n_colors <- length(level_order)
   if (n_colors > 2) {
-    cols <- if ("No uORF" %in% level_order) {
+    cols <- if ("No TuORF" %in% level_order) {
       c(
-        "No uORF" = "#999999",
+        "No TuORF" = "#999999",
         setNames(
           colorRampPalette(RColorBrewer::brewer.pal(5, color_pal))(n_colors - 1),
           level_order[-1]
@@ -2974,7 +3184,7 @@ p8A <- create_fig8_violinbox(
   data_df    = dplyr::bind_rows(df_uorf, df_no_uorf),
   x_col      = "Length_Bin",
   y_col      = "TE",
-  plot_title = "A: All uORFs vs No uORF",
+  plot_title = "A: All TuORFs vs No TuORF",
   color_pal  = "Blues",
   y_limit    = c(0, 3)
 )
@@ -2983,18 +3193,18 @@ p8B <- create_fig8_violinbox(
   data_df    = dplyr::bind_rows(df_uorf %>% dplyr::filter(pUP > 30), df_no_uorf),
   x_col      = "Length_Bin",
   y_col      = "TE",
-  plot_title = "B: Strong uORFs (pUP > 30) vs No uORF",
+  plot_title = "B: TuORFs with >30% uORF+ vs No TuORF",
   color_pal  = "Greens",
   y_limit    = c(0, 3)
 )
 
 df_bar <- df_uorf %>%
-  dplyr::mutate(Cutoff_Group = dplyr::if_else(pUP > 30, "Kept (>30% pUP)", "Removed (<=30% pUP)")) %>%
+  dplyr::mutate(Cutoff_Group = dplyr::if_else(pUP > 30, "Kept (>30% uORF+)", "Removed (<=30% uORF+)")) %>%
   dplyr::group_by(Length_Bin, Cutoff_Group) %>%
   dplyr::summarise(Count = dplyr::n(), .groups = "drop")
 
 df_bar$Length_Bin <- factor(df_bar$Length_Bin, levels = level_order_uorf)
-df_bar$Cutoff_Group <- factor(df_bar$Cutoff_Group, levels = c("Removed (<=30% pUP)", "Kept (>30% pUP)"))
+df_bar$Cutoff_Group <- factor(df_bar$Cutoff_Group, levels = c("Removed (<=30% uORF+)", "Kept (>30% uORF+)"))
 
 p8C <- ggplot2::ggplot(df_bar, ggplot2::aes(x = Length_Bin, y = Count, fill = Cutoff_Group)) +
   ggplot2::geom_bar(stat = "identity", position = "stack", width = 0.7) +
@@ -3003,7 +3213,7 @@ p8C <- ggplot2::ggplot(df_bar, ggplot2::aes(x = Length_Bin, y = Count, fill = Cu
     position = ggplot2::position_stack(vjust = 0.5),
     color = "white", size = 3, fontface = "bold"
   ) +
-  ggplot2::scale_fill_manual(values = c("Removed (<=30% pUP)" = "#E74C3C", "Kept (>30% pUP)" = "#2ECC71")) +
+  ggplot2::scale_fill_manual(values = c("Removed (<=30% uORF+)" = "#E74C3C", "Kept (>30% uORF+)" = "#2ECC71")) +
   ggplot2::theme_classic() +
   ggplot2::labs(title = "C: Genes Removed vs Kept", x = "uORF Length (AA)", y = "Count", fill = "") +
   ggplot2::theme(plot.title = ggplot2::element_text(face = "bold", size = 10), legend.position = "top")
@@ -3026,7 +3236,7 @@ p8D <- ggplot2::ggplot(df_perc, ggplot2::aes(x = Length_Bin, y = Percent, fill =
   ggplot2::scale_fill_brewer(palette = "OrRd") +
   ggplot2::coord_cartesian(ylim = c(0, 100)) +
   ggplot2::theme_classic() +
-  ggplot2::labs(title = "D: % Removed by 30% pUP Cutoff", x = "uORF Length (AA)", y = "% Removed") +
+  ggplot2::labs(title = "D: % removed by the 30% uORF+ cutoff", x = "uORF Length (AA)", y = "% Removed") +
   ggplot2::theme(plot.title = ggplot2::element_text(face = "bold", size = 10), legend.position = "none")
 
 df_uorf$Length_Bin <- factor(df_uorf$Length_Bin, levels = level_order_uorf)
@@ -3037,7 +3247,7 @@ p8E <- ggplot2::ggplot(df_uorf, ggplot2::aes(x = Length_Bin, y = pUP, fill = Len
   ggplot2::scale_fill_brewer(palette = "Purples") +
   ggplot2::coord_cartesian(ylim = c(0, 100)) +
   ggplot2::theme_classic() +
-  ggplot2::labs(title = "E: pUP Distribution", x = "uORF Length (AA)", y = "% pUP") +
+  ggplot2::labs(title = "E: %uORF+ distribution", x = "uORF Length (AA)", y = "%uORF+ (CAGE)") +
   ggplot2::theme(plot.title = ggplot2::element_text(face = "bold", size = 10), legend.position = "none")
 
 p8F <- create_fig8_violinbox(
@@ -3053,7 +3263,7 @@ p8G <- create_fig8_violinbox(
   data_df    = df_uorf %>% dplyr::filter(pUP > 30),
   x_col      = "Length_Bin",
   y_col      = "log2_uIF",
-  plot_title = "G: log2(uIF) vs Length (Strong uORFs >30% pUP)",
+  plot_title = "G: log2(uIF) vs Length (TuORFs >30% uORF+)",
   color_pal  = "Oranges",
   y_limit    = c(-7, 8)
 )
@@ -3198,7 +3408,7 @@ all_uorf_genes <- unique(df_all_uorfs_univ$gene_id_u)
 universe_genes <- intersect(all_uorf_genes, unique(go_full$gene))
 universe_go <- go_full %>% dplyr::filter(gene %in% universe_genes)
 
-message("Universe size (any-uORF genes with GO): ", length(universe_genes))
+message("Universe size (any-uORF genes with GO): ", length(universe_genes)); writeLines(as.character(length(universe_genes)), file.path(OUT_DIR, "GO_universe_size.txt"))   # background size for the A9 figure subtitles (2026-11-01)
 if (length(universe_genes) < 50) stop("Universe too small; check GO file / ID formats.")
 
 OUT_df6_go <- OUT_df6 %>%
@@ -3236,18 +3446,18 @@ genes_group4 <- gene_summary %>%
   unique() %>%
   intersect(universe_genes)
 
-GROUP4_NAME <- ">=1 strong uORF or >=2 uORFs"
+GROUP4_NAME <- ">=1 high-uIF uORF or >=2 TuORFs"
 
 ## ---------------------------------------------------------------------------
 ## GROUPING (A): by uIF — TuORF translational strength   [original grouping]
 ## ---------------------------------------------------------------------------
 group_lists_uIF <- list(
-  "1-uORF Weak"   = genes_1weak,
-  "1-uORF Mid"    = genes_1mid,
-  "1-uORF Strong" = genes_1strong
+  "1-uORF low uIF"   = genes_1weak,
+  "1-uORF medium uIF"    = genes_1mid,
+  "1-uORF high uIF" = genes_1strong
 )
 group_lists_uIF[[GROUP4_NAME]] <- genes_group4
-group_order_uIF <- c("1-uORF Weak", "1-uORF Mid", "1-uORF Strong", GROUP4_NAME)
+group_order_uIF <- c("1-uORF low uIF", "1-uORF medium uIF", "1-uORF high uIF", GROUP4_NAME)
 
 ## ---------------------------------------------------------------------------
 ## GROUPING (B): by %uORF+ (pUP) — TSS-determined uORF inclusion
@@ -3466,7 +3676,7 @@ run_go_for_grouping <- function(group_lists, group_order, file_slug, grouping_de
 go_res_uIF <- run_go_for_grouping(
   group_lists_uIF, group_order_uIF,
   file_slug     = "uIF",
-  grouping_desc = "uORF impact factor (uIF): Weak <= 0.2 < Mid <= 1 < Strong"
+  grouping_desc = "uORF intensity factor (uIF): low <= 0.2 < medium <= 1 < high"
 )
 
 go_res_pUP <- run_go_for_grouping(
@@ -3525,14 +3735,14 @@ df_uif_hl <- OUT_df6 %>%
   dplyr::filter(uIF < 15) %>%
   dplyr::mutate(
     uIF_Group = dplyr::case_when(
-      uIF > 1   ~ "Strong uORF (>1)",
-      uIF > 0.2 ~ "Mid uORF (>0.2 - 1)",
-      TRUE      ~ "Weak uORF (0 - 0.2)"
+      uIF > 1   ~ "High uIF (>1)",
+      uIF > 0.2 ~ "Medium uIF (0.2-1)",
+      TRUE      ~ "Low uIF (<=0.2)"
     )
   )
 
 df_no_hl <- half_lives %>%
-  dplyr::filter(!gene_id %in% unique(OUT_df6$gene_id)) %>%
+  dplyr::filter(!gene_id %in% upstream_translated_genes) %>%   # was: only the analysed single-TuORF genes; now: no TuORF AND no ouORF
   dplyr::transmute(gene_id, half_life_mean, Group_Label = "No TuORF")
 
 # 9A: ECDF — legend adjusted (right side + smaller)
@@ -3543,7 +3753,7 @@ plot9A_data <- dplyr::bind_rows(
 
 plot9A_data$Group_Label <- factor(
   plot9A_data$Group_Label,
-  levels = c("Strong uORF (>1)", "Mid uORF (>0.2 - 1)", "Weak uORF (0 - 0.2)", "No TuORF")
+  levels = c("High uIF (>1)", "Medium uIF (0.2-1)", "Low uIF (<=0.2)", "No TuORF")
 )
 
 stats9A <- generate_legend_labels(plot9A_data, "Group_Label", "half_life_mean")
@@ -3587,7 +3797,7 @@ p9B <- ggplot2::ggplot(
 # 9C: log2(uIF) scatter — MID + STRONG only
 p9C <- ggplot2::ggplot(
   df_uif_hl %>% 
-    dplyr::filter(uIF_Group %in% c("Mid uORF (>0.2 - 1)", "Strong uORF (>1)"),
+    dplyr::filter(uIF_Group %in% c("Medium uIF (0.2-1)", "High uIF (>1)"),
                   is.finite(uIF), uIF > 0),
   ggplot2::aes(x = log2(uIF), y = half_life_mean)
 ) +
@@ -3595,7 +3805,7 @@ p9C <- ggplot2::ggplot(
   ggplot2::geom_smooth(method = "lm", color = "red", size = 1, se = FALSE) +
   ggpubr::stat_cor(method = "pearson", label.x.npc = "left", label.y.npc = "top", size = 4) +
   ggplot2::theme_classic() +
-  ggplot2::labs(title = "C: log2(uIF) vs half-life (mid + strong uORF genes only)",
+  ggplot2::labs(title = "C: log2(uIF) vs half-life (medium- and high-uIF genes only)",
                 x = bquote(log[2]~"(uIF)"), y = "mRNA half-life (h)") +
   ggplot2::theme(plot.title = ggplot2::element_text(face = "bold", size = 16))
 
@@ -3661,7 +3871,7 @@ p9E <- ggplot2::ggplot(
   ggplot2::geom_smooth(method = "lm", color = "red", size = 1, se = FALSE) +
   ggpubr::stat_cor(method = "pearson", label.x.npc = "left", label.y.npc = "top") +
   ggplot2::theme_classic() +
-  ggplot2::labs(title = "E", x = "%pUP (CAGE)", y = "mRNA half-life (h)") +
+  ggplot2::labs(title = "E", x = "%uORF+ (CAGE)", y = "mRNA half-life (h)") +
   ggplot2::theme(plot.title = ggplot2::element_text(face = "bold", size = 16))
 
 # 9F: pUP scatter — MID + STRONG only
@@ -3673,8 +3883,8 @@ p9F <- ggplot2::ggplot(
   ggplot2::geom_smooth(method = "lm", color = "red", size = 1, se = FALSE) +
   ggpubr::stat_cor(method = "pearson", label.x.npc = "left", label.y.npc = "top") +
   ggplot2::theme_classic() +
-  ggplot2::labs(title = "F: %pUP vs half-life (mid + strong uORF genes only)",
-                x = "%pUP (CAGE)", y = "mRNA half-life (h)") +
+  ggplot2::labs(title = "F: %pUP vs half-life (medium- and high-uIF genes only)",
+                x = "%uORF+ (CAGE)", y = "mRNA half-life (h)") +
   ggplot2::theme(plot.title = ggplot2::element_text(face = "bold", size = 16))
 
 # ------------------------------------------------------------------------------
@@ -3839,7 +4049,7 @@ generate_uorf_order_fig <- function(data, n_uorfs, file_suffix) {
     ggplot2::stat_ecdf(geom = "step", size = 1.2) +
     ggplot2::scale_color_brewer(palette = "Dark2") +
     ggplot2::theme_classic() +
-    ggplot2::labs(title = paste("D: pUP ECDF", plot_title_base), x="% pUP", y="Fraction", color="Order") +
+    ggplot2::labs(title = paste("D: pUP ECDF", plot_title_base), x="%uORF+ (CAGE)", y="Fraction", color="Order") +
     ggplot2::theme(plot.title = ggplot2::element_text(face="bold", size=10))
   
   stats_pup <- get_stat_letters(df_subset, "pUP")
@@ -3848,7 +4058,7 @@ generate_uorf_order_fig <- function(data, n_uorfs, file_suffix) {
     ggplot2::coord_cartesian(ylim = c(0, 110)) +
     ggplot2::scale_fill_brewer(palette = "Dark2") +
     ggplot2::theme_classic() +
-    ggplot2::labs(title = "E: pUP Boxplot", x="", y="% pUP") +
+    ggplot2::labs(title = "E: pUP Boxplot", x="", y="%uORF+ (CAGE)") +
     ggplot2::theme(plot.title = ggplot2::element_text(face="bold", size=10), legend.position="none")
   
   if (!is.null(stats_pup)) {
@@ -3861,7 +4071,7 @@ generate_uorf_order_fig <- function(data, n_uorfs, file_suffix) {
     ggplot2::geom_boxplot(width = 0.1, fill = "white", outlier.shape = NA) +
     ggplot2::scale_fill_brewer(palette = "Dark2") +
     ggplot2::theme_classic() +
-    ggplot2::labs(title = "F: pUP Distribution", x="", y="% pUP") +
+    ggplot2::labs(title = "F: pUP Distribution", x="", y="%uORF+ (CAGE)") +
     ggplot2::theme(plot.title = ggplot2::element_text(face="bold", size=10), legend.position="none")
   
   Fig_combined <- ggpubr::ggarrange(pA, pB, pC, pD, pE, pF, ncol=3, nrow=2, labels="AUTO")
@@ -3989,7 +4199,7 @@ message(paste("Total Unique Transcripts Loaded:", nrow(df_transcripts)))
 # ==============================================================================
 message("Loading GTF to map transcripts to genome coordinates...")
 if (!exists("txdb")) {
-  txdb <- GenomicFeatures::makeTxDbFromGFF(
+  txdb <- .make_txdb(
     file = PATH_GTF, format = "gtf",
     dataSource = "Araport11", organism = "Arabidopsis"
   )
@@ -4046,12 +4256,13 @@ if (!exists("pUP_CAGE_tbl"))
 if (!exists("pUP_TSS_tbl"))
   pUP_TSS_tbl  <- if (TSS_SOURCE == "TSS")  OUT_pUP else .compute_pUP_from_source(PATH_CAGE_TSSseq)
 
-run_transcriptome_impact <- function(pUP_tbl, src_tag) {
+run_transcriptome_impact <- function(pUP_tbl, src_tag, pred_best = NULL, ou_tbl = NULL) {
 
   message(">>> Transcriptome-wide TuORF impact [", src_tag, "] <<<")
 
   # ---- unique uORFs + pUP per genomic location ----
   df_uorf_unique <- mORF_uORF_Info %>%
+    dplyr::filter(ORF_type == "uORF") %>%   # A/B rows = non-overlapping TuORFs only; ouORFs are covered by the "U." rows
     dplyr::select(uORF_start_bio, uORF_stop_bio, chr, Strand, tx_id, genome_range) %>%
     dplyr::mutate(unique_key = paste(tx_id, genome_range, sep = "|")) %>%
     dplyr::left_join(
@@ -4060,10 +4271,11 @@ run_transcriptome_impact <- function(pUP_tbl, src_tag) {
     ) %>%
     dplyr::mutate(
       g_start = pmin(uORF_start_bio, uORF_stop_bio),
-      g_end   = pmax(uORF_start_bio, uORF_stop_bio)
+      g_end   = pmax(uORF_start_bio, uORF_stop_bio),
+      uorf_gene = sub("\\.\\d+$", "", tx_id)        # gene of the TuORF (2026-10-29: mapping restricted to its own gene)
     ) %>%
     dplyr::filter(!is.na(g_start) & !is.na(g_end)) %>%
-    dplyr::group_by(chr, g_start, g_end, Strand) %>%
+    dplyr::group_by(chr, g_start, g_end, Strand, uorf_gene) %>%
     dplyr::summarise(pUP = max(pUP, na.rm = TRUE), .groups = "drop")
 
   # ---- endpoint-in-exon mapping (spliced-safe) ----
@@ -4086,6 +4298,9 @@ run_transcriptome_impact <- function(pUP_tbl, src_tag) {
                          transcript_id = names(exons_target)[S4Vectors::subjectHits(hits_e)],
                          stringsAsFactors = FALSE)
   df_mapping <- unique(merge(df_map_s, df_map_e, by = c("uorf_idx", "transcript_id")))
+  # 2026-10-29: keep only transcripts of the uORF's own gene. Without this, a TuORF lying inside the coding exons of a
+  # nested host gene (e.g. AT1G07590's TuORF = the CDS of AT1G07600/MT1A, 8,100 TPM) made the host mRNA 'uORF-containing'.
+  df_mapping <- df_mapping[sub("\\.\\d+$", "", df_mapping$transcript_id) == df_uorf_unique$uorf_gene[df_mapping$uorf_idx], ]
   df_mapping$pUP <- df_uorf_unique$pUP[df_mapping$uorf_idx]
 
   # best uORF per transcript (max pUP = fraction of transcripts carrying >=1 uORF)
@@ -4097,6 +4312,22 @@ run_transcriptome_impact <- function(pUP_tbl, src_tag) {
 
   message("[", src_tag, "] transcripts mapped to uORFs (endpoint-safe): ",
           nrow(df_best_uorf_expanded))
+
+  # ---- overlapping uORFs (ouORFs): same endpoint-in-exon mapping, if supplied ----
+  ou_best <- NULL
+  if (!is.null(ou_tbl) && nrow(ou_tbl) > 0) {
+    gs_ou <- GenomicRanges::GRanges(ou_tbl$chr, IRanges::IRanges(start = ou_tbl$g_start, width = 1), strand = ou_tbl$Strand)
+    ge_ou <- GenomicRanges::GRanges(ou_tbl$chr, IRanges::IRanges(start = ou_tbl$g_end,   width = 1), strand = ou_tbl$Strand)
+    hs_ou <- GenomicRanges::findOverlaps(gs_ou, exons_target, type = "within")
+    he_ou <- GenomicRanges::findOverlaps(ge_ou, exons_target, type = "within")
+    ms_ou <- data.frame(i = S4Vectors::queryHits(hs_ou), transcript_id = names(exons_target)[S4Vectors::subjectHits(hs_ou)], stringsAsFactors = FALSE)
+    me_ou <- data.frame(i = S4Vectors::queryHits(he_ou), transcript_id = names(exons_target)[S4Vectors::subjectHits(he_ou)], stringsAsFactors = FALSE)
+    mo_ou <- unique(merge(ms_ou, me_ou, by = c("i", "transcript_id")))
+    if ("uorf_gene" %in% colnames(ou_tbl)) mo_ou <- mo_ou[sub("\\.\\d+$", "", mo_ou$transcript_id) == ou_tbl$uorf_gene[mo_ou$i], ]   # same gene only (2026-10-29)
+    mo_ou$pUP <- ou_tbl$pUP[mo_ou$i]
+    ou_best <- mo_ou %>% dplyr::group_by(transcript_id) %>% dplyr::summarise(Max_pUP_ou = max(pUP), .groups = "drop")
+    message("[", src_tag, "] transcripts mapped to ouORFs (endpoint-safe): ", nrow(ou_best))
+  }
 
   # ---- per-transcript TPM, Max_pUP, category ----
   df_calc_tx <- df_transcripts %>%
@@ -4113,6 +4344,38 @@ run_transcriptome_impact <- function(pUP_tbl, src_tag) {
         TRUE ~ "Nuclear_no_5UTR"
       )
     )
+
+  # ---- predicted AUG uORFs (annotation view) per transcript, if supplied ----
+  if (!is.null(pred_best)) {
+    df_calc_tx <- df_calc_tx %>%
+      dplyr::left_join(pred_best, by = "transcript_id") %>%
+      dplyr::mutate(
+        n_pred_uORFs      = ifelse(is.na(n_pred_uORFs), 0L, n_pred_uORFs),
+        Has_pred_uORF     = n_pred_uORFs > 0,
+        Max_pUP_pred      = ifelse(is.na(Max_pUP_pred), 0, Max_pUP_pred),
+        Affected_TPM_pred = TPM * (Max_pUP_pred / 100)
+      )
+  } else {
+    df_calc_tx <- df_calc_tx %>%
+      dplyr::mutate(n_pred_uORFs = NA_integer_, Has_pred_uORF = NA,
+                    Max_pUP_pred = NA_real_, Affected_TPM_pred = NA_real_)
+  }
+
+  # ---- TuORF + ouORF ("any detected upstream translation") per transcript, if supplied ----
+  if (!is.null(ou_best)) {
+    df_calc_tx <- df_calc_tx %>%
+      dplyr::left_join(ou_best, by = "transcript_id") %>%
+      dplyr::mutate(
+        Has_ouORF       = !is.na(Max_pUP_ou),
+        Max_pUP_ou      = ifelse(is.na(Max_pUP_ou), 0, Max_pUP_ou),
+        Has_up          = Has_uORF | Has_ouORF,
+        Max_pUP_up      = pmax(Max_pUP, Max_pUP_ou),
+        Affected_TPM_up = TPM * (Max_pUP_up / 100)
+      )
+  } else {
+    df_calc_tx <- df_calc_tx %>%
+      dplyr::mutate(Has_ouORF = NA, Max_pUP_ou = NA_real_, Has_up = NA, Max_pUP_up = NA_real_, Affected_TPM_up = NA_real_)
+  }
 
   tpm_sums <- df_calc_tx %>%
     dplyr::group_by(Category) %>%
@@ -4151,6 +4414,32 @@ run_transcriptome_impact <- function(pUP_tbl, src_tag) {
   n_gene_5utr_total    <- nrow(df_gene_5utr)
   n_gene_5utr_uorf     <- sum(df_gene_5utr$Has_uORF)
   n_gene_5utr_uorf_p30 <- sum(df_gene_5utr$Has_uORF_p30)
+
+  # ---- predicted-uORF (annotation view) aggregates ----
+  if (!is.null(pred_best)) {
+    pred_tx_5utr_n   <- sum(df_tx_5utr$Has_pred_uORF, na.rm = TRUE)
+    pred_gene_5utr_n <- df_tx_5utr %>% dplyr::group_by(gene_id) %>%
+      dplyr::summarise(h = any(Has_pred_uORF), .groups = "drop") %>% dplyr::pull(h) %>% sum()
+    pred_gene_expr   <- df_calc_tx %>% dplyr::group_by(gene_id) %>%
+      dplyr::summarise(TPM = sum(TPM, na.rm = TRUE), h = any(Has_pred_uORF), .groups = "drop")
+    pred_gene_expr_n  <- sum(pred_gene_expr$h & pred_gene_expr$TPM > 0, na.rm = TRUE)
+    pred_unscaled_tpm <- sum(df_nuc_tx$TPM[df_nuc_tx$Has_pred_uORF], na.rm = TRUE)
+    pred_scaled_tpm   <- sum(df_nuc_tx$Affected_TPM_pred, na.rm = TRUE)
+    pred_scaled_Tu    <- sum(df_nuc_tx$Affected_TPM_pred[df_nuc_tx$Has_uORF],  na.rm = TRUE)
+    pred_scaled_noTu  <- sum(df_nuc_tx$Affected_TPM_pred[!df_nuc_tx$Has_uORF], na.rm = TRUE)
+    tu_without_pred_n <- sum(df_nuc_tx$Has_uORF & !df_nuc_tx$Has_pred_uORF, na.rm = TRUE)
+  }
+
+  # ---- TuORF + ouORF aggregates ----
+  if (!is.null(ou_best)) {
+    up_tx_5utr_n     <- sum(df_tx_5utr$Has_up, na.rm = TRUE)
+    up_gene_5utr_n   <- df_tx_5utr %>% dplyr::group_by(gene_id) %>% dplyr::summarise(h = any(Has_up),    .groups = "drop") %>% dplyr::pull(h) %>% sum()
+    ou_gene_5utr_n   <- df_tx_5utr %>% dplyr::group_by(gene_id) %>% dplyr::summarise(h = any(Has_ouORF), .groups = "drop") %>% dplyr::pull(h) %>% sum()
+    up_unscaled_tpm  <- sum(df_nuc_tx$TPM[df_nuc_tx$Has_up], na.rm = TRUE)
+    up_scaled_tpm    <- sum(df_nuc_tx$Affected_TPM_up, na.rm = TRUE)
+    ou_only_unscaled <- sum(df_nuc_tx$TPM[df_nuc_tx$Has_ouORF & !df_nuc_tx$Has_uORF], na.rm = TRUE)
+    ou_only_scaled   <- sum(df_nuc_tx$Affected_TPM_up[df_nuc_tx$Has_ouORF & !df_nuc_tx$Has_uORF], na.rm = TRUE)
+  }
 
   # ---- expressed-gene context (manuscript: "~20% of expressed genes") ----
   df_gene_all <- df_calc_tx %>%
@@ -4238,12 +4527,103 @@ run_transcriptome_impact <- function(pUP_tbl, src_tag) {
     stringsAsFactors = FALSE
   )
 
+  # ---- predicted-uORF rows (annotation view): the apples-to-apples ladder next to the TuORF rows ----
+  if (!is.null(pred_best)) {
+    pred_rows <- data.frame(
+      Metric = c(
+        "----------------------------------",
+        paste0("P. PREDICTED AUG uORFs in the annotated 5' UTRs of the expressed isoforms (annotation view; ORFik minimumLength = ",
+               PRED_UORF_MIN_CODONS, " codons between AUG and stop; nested in-frame AUGs kept)"),
+        "   Nuclear 5'UTR transcripts with >=1 predicted uORF",
+        "   5'UTR-containing nuclear genes with >=1 predicted uORF  [gene-count view; cf. 55% of genes in ref 1]",
+        "   Genes with RNA-seq TPM > 0 (2-isoform RSEM set) with >=1 predicted uORF",
+        "   Transcripts with a mapped TuORF but no predicted uORF from the scan (TuORF stop overlaps the CDS start, or no 5'UTR in the 2-isoform GTF)",
+        "P1. Total TPM of transcripts with >=1 predicted uORF (Unscaled, annotation view)",
+        "   % Mass with predicted uORF(s) (of 5' UTR Transcripts)",
+        "   % Mass with predicted uORF(s) (of ALL Nuclear Transcripts)",
+        "P2. Total TPM scaled by the max %uORF+ of the predicted uORFs (TSS-weighted)",
+        "   % Mass with predicted uORF(s) after TSS scaling (of 5' UTR Transcripts)",
+        "   % Mass with predicted uORF(s) after TSS scaling (of ALL Nuclear Transcripts)",
+        "P3. Of P2: TPM from transcripts WITH a mapped TuORF",
+        "   Of P2: TPM from transcripts WITHOUT a mapped TuORF (predicted-only uORFs surviving TSS scaling)",
+        "   % Mass (of 5' UTR Transcripts) from predicted-only uORFs after TSS scaling"
+      ),
+      Value = c(
+        "----------------",
+        "",
+        fmt_n_pct(pred_tx_5utr_n,   n_tx_5utr_total),
+        fmt_n_pct(pred_gene_5utr_n, n_gene_5utr_total),
+        fmt_n_pct(pred_gene_expr_n, n_genes_expressed),
+        tu_without_pred_n,
+        round(pred_unscaled_tpm, 2),
+        pct1(pred_unscaled_tpm, val_nuc_utr),
+        pct1(pred_unscaled_tpm, val_nuc_all),
+        round(pred_scaled_tpm, 2),
+        pct1(pred_scaled_tpm, val_nuc_utr),
+        pct1(pred_scaled_tpm, val_nuc_all),
+        round(pred_scaled_Tu, 2),
+        round(pred_scaled_noTu, 2),
+        pct1(pred_scaled_noTu, val_nuc_utr)
+      ),
+      stringsAsFactors = FALSE
+    )
+    results_table <- rbind(results_table, pred_rows)
+  }
+
+  # ---- TuORF + ouORF rows: any detected upstream translation ----
+  if (!is.null(ou_best)) {
+    ou_rows <- data.frame(
+      Metric = c(
+        "----------------------------------",
+        "U. TuORFs + ouORFs (any detected upstream translation: RiboTaper/CiPS non-overlapping TuORFs plus CiPS overlapping uORFs; %uORF+ by each ORF's start codon)",
+        "   Nuclear 5'UTR transcripts with >=1 TuORF or ouORF",
+        "   5'UTR-containing nuclear genes with >=1 TuORF or ouORF",
+        "   5'UTR-containing nuclear genes with >=1 mapped ouORF",
+        "U1. Total TPM of transcripts with >=1 TuORF or ouORF (Unscaled)",
+        "   % Mass with TuORF/ouORF (of 5' UTR Transcripts)",
+        "   % Mass with TuORF/ouORF (of ALL Nuclear Transcripts)",
+        "U2. Total TPM scaled by the max %uORF+ over TuORFs and ouORFs (TSS-weighted)",
+        "   % Mass with TuORF/ouORF after TSS scaling (of 5' UTR Transcripts)",
+        "   % Mass with TuORF/ouORF after TSS scaling (of ALL Nuclear Transcripts)",
+        "U3. ouORF-only transcripts (no mapped TuORF): TPM unscaled / TSS-scaled",
+        "   % Mass (of 5' UTR Transcripts) from ouORF-only transcripts: unscaled / TSS-scaled"
+      ),
+      Value = c(
+        "----------------",
+        "",
+        fmt_n_pct(up_tx_5utr_n,   n_tx_5utr_total),
+        fmt_n_pct(up_gene_5utr_n, n_gene_5utr_total),
+        fmt_n_pct(ou_gene_5utr_n, n_gene_5utr_total),
+        round(up_unscaled_tpm, 2),
+        pct1(up_unscaled_tpm, val_nuc_utr),
+        pct1(up_unscaled_tpm, val_nuc_all),
+        round(up_scaled_tpm, 2),
+        pct1(up_scaled_tpm, val_nuc_utr),
+        pct1(up_scaled_tpm, val_nuc_all),
+        paste(round(ou_only_unscaled, 2), "/", round(ou_only_scaled, 2)),
+        paste(pct1(ou_only_unscaled, val_nuc_utr), "/", pct1(ou_only_scaled, val_nuc_utr))
+      ),
+      stringsAsFactors = FALSE
+    )
+    results_table <- rbind(results_table, ou_rows)
+  }
+
   print(knitr::kable(results_table,
         caption = paste0("Transcriptome-wide TuORF impact (multi-isoform corrected; TSS source = ",
                          src_tag, ")")))
   out_csv <- file.path(OUT_DIR, paste0("Table_Transcriptome_Impact_MultiIsoform_", src_tag, ".csv"))
   write.csv(results_table, out_csv, row.names = FALSE)
   message("[", src_tag, "] wrote ", out_csv)
+
+  # per-transcript backing table (TuORF view + predicted view side by side)
+  per_tx_csv <- file.path(OUT_DIR, paste0("Table_Transcriptome_Impact_PerTranscript_", src_tag, ".csv"))
+  write.csv(
+    df_calc_tx %>% dplyr::select(transcript_id, gene_id, Category, TPM,
+                                 TuORF_mapped = Has_uORF, Max_pUP_TuORF = Max_pUP,
+                                 n_pred_uORFs, Max_pUP_pred,
+                                 ouORF_mapped = Has_ouORF, Max_pUP_ouORF = Max_pUP_ou),
+    per_tx_csv, row.names = FALSE)
+  message("[", src_tag, "] wrote ", per_tx_csv)
 
   # ---- plots ----
   df_plot_data <- df_nuc_tx %>%
@@ -4256,7 +4636,7 @@ run_transcriptome_impact <- function(pUP_tbl, src_tag) {
     ggplot2::coord_cartesian(xlim = c(0, 100)) +
     ggplot2::theme_classic() +
     ggplot2::labs(title = paste0("A: Transcripts Affected (", src_tag, ")"),
-                  x = "% pUP (max per transcript)", y = "Count") +
+                  x = "%uORF+ (max per transcript)", y = "Count") +
     ggplot2::theme(plot.title = ggplot2::element_text(face = "bold"))
 
   pB <- ggplot2::ggplot(df_plot_data, ggplot2::aes(x = pUP_Bin, y = TPM)) +
@@ -4264,7 +4644,7 @@ run_transcriptome_impact <- function(pUP_tbl, src_tag) {
     ggplot2::scale_y_continuous(trans = "log2", labels = scales::comma) +
     ggplot2::theme_classic() +
     ggplot2::labs(title = paste0("B: Expression vs pUP (", src_tag, ")"),
-                  x = "% pUP Bin", y = "TPM (log2)") +
+                  x = "%uORF+ bin", y = "TPM (log2)") +
     ggplot2::theme(plot.title = ggplot2::element_text(face = "bold"),
                    axis.text.x = ggplot2::element_text(angle = 90, vjust = 0.5))
 
@@ -4277,8 +4657,110 @@ run_transcriptome_impact <- function(pUP_tbl, src_tag) {
   invisible(list(table = results_table, per_transcript = df_calc_tx))
 }
 
-Impact_CAGE   <- run_transcriptome_impact(pUP_CAGE_tbl, "CAGE")
-Impact_TSSseq <- run_transcriptome_impact(pUP_TSS_tbl,  "TSSseq")
+# ==============================================================================
+# PREDICTED AUG uORFs (annotation view) — added 2026-10-27 for the Genome Research
+# revision. Reviewer 2: the 55% gene-count figure (ref 1, sequence-predicted uORFs)
+# and the 9.6% TuORF estimate (Ribo-seq-detected, abundance-weighted) are not
+# comparable. Here every expressed isoform's annotated 5'UTR (PATH_GTF2 = the RSEM
+# isoform set) is scanned for AUG-initiated ORFs, %uORF+ is computed for each with
+# the SAME window and formula as the TuORFs, and the same ladder
+# (gene count -> TPM-weighted -> TSS-scaled) is reported next to the TuORF rows.
+# Outputs: Table_Predicted_AUG_uORFs_expressed_isoforms.csv (one row per predicted
+# uORF, both TSS sources) and the "P." rows of both impact tables.
+# ==============================================================================
+PRED_UORF_MIN_CODONS <- 0   # ORFik minimumLength = codons between AUG and stop; 0 = AUG-stop allowed (the TuORF set has 1-aa uORFs)
+
+message(">>> Predicted AUG uORF scan on expressed isoforms (annotation view) <<<")
+txdb_pred <- if (exists("txdb_uu_4")) txdb_uu_4 else
+  .make_txdb(file = PATH_GTF2, format = "gtf", dataSource = "Araport11", organism = "Arabidopsis")
+
+tryCatch({ Rsamtools::indexFa(PATH_FASTA_TAIR10) }, error = function(e) NULL)
+fa_pred <- Rsamtools::FaFile(PATH_FASTA_TAIR10)
+if (!Rsamtools::isOpen(fa_pred)) open(fa_pred)
+fa_levels_pred <- GenomeInfoDb::seqlevels(GenomeInfoDb::seqinfo(Rsamtools::scanFaIndex(fa_pred)))
+
+utr5_pred <- GenomicFeatures::fiveUTRsByTranscript(txdb_pred, use.names = TRUE)
+utr5_pred <- utr5_pred[S4Vectors::elementNROWS(utr5_pred) > 0]
+utr5_pred <- utr5_pred[names(utr5_pred) %in% df_transcripts$transcript_id]
+utr_lv_pred <- GenomeInfoDb::seqlevels(BiocGenerics::unlist(utr5_pred))
+new_lv_pred <- normalize_chr_to_ref(utr_lv_pred, fa_levels_pred); names(new_lv_pred) <- utr_lv_pred
+if (any(new_lv_pred != utr_lv_pred)) utr5_pred <- GenomeInfoDb::renameSeqlevels(utr5_pred, new_lv_pred)
+utr5_seqs_pred <- GenomicFeatures::extractTranscriptSeqs(fa_pred, utr5_pred)
+
+pred_orfs <- ORFik::findMapORFs(
+  utr5_pred, utr5_seqs_pred,
+  startCodon    = "ATG",
+  longestORF    = FALSE,   # keep nested in-frame AUGs: the mORF-proximal start decides whether a transcript carries >=1 uORF
+  groupByTx     = FALSE,
+  minimumLength = PRED_UORF_MIN_CODONS
+)
+if (length(pred_orfs) == 0) stop("Predicted-uORF scan returned 0 ORFs.")
+
+pred_rng <- BiocGenerics::unlist(range(pred_orfs))   # one range per ORF (an ORF lies within one transcript: one chr, one strand)
+pred_strand <- as.character(BiocGenerics::strand(pred_rng))
+pred_targets <- data.frame(
+  unique_key     = names(pred_orfs),
+  tx_id          = sub("_[0-9]+$", "", names(pred_orfs)),
+  chr            = gsub("^chr|^Chr", "", as.character(GenomeInfoDb::seqnames(pred_rng)), ignore.case = TRUE),
+  Strand         = pred_strand,
+  uORF_start_bio = ifelse(pred_strand == "+", as.integer(BiocGenerics::start(pred_rng)), as.integer(BiocGenerics::end(pred_rng))),
+  uORF_length_nt = as.integer(sum(BiocGenerics::width(pred_orfs))),
+  stringsAsFactors = FALSE
+)
+pred_targets$gene_id        <- substr(pred_targets$tx_id, 1, 9)
+pred_targets$uORF_length_aa <- pred_targets$uORF_length_nt / 3 - 1
+message("Predicted uORFs: ", nrow(pred_targets), " in ", dplyr::n_distinct(pred_targets$tx_id),
+        " transcripts (of ", length(utr5_pred), " expressed isoforms with a 5'UTR)")
+
+## TSS windows for every expressed isoform carrying a predicted uORF — SAME definition as section 3
+tss_windows_pred <- .make_tss_windows(txdb, unique(pred_targets$tx_id))
+message("Windows built for ", length(tss_windows_pred), " of ", dplyr::n_distinct(pred_targets$tx_id), " transcripts")
+
+pred_pUP_CAGE <- .compute_pUP_for_targets(PATH_CAGE_CAGEseq, pred_targets, tss_windows_pred)
+pred_pUP_TSS  <- .compute_pUP_for_targets(PATH_CAGE_TSSseq,  pred_targets, tss_windows_pred)
+pred_targets <- pred_targets %>%
+  dplyr::left_join(as.data.frame(pred_pUP_CAGE) %>% dplyr::rename(pUP_CAGE = pUP), by = "unique_key") %>%
+  dplyr::left_join(as.data.frame(pred_pUP_TSS)  %>% dplyr::rename(pUP_TSS  = pUP), by = "unique_key") %>%
+  dplyr::mutate(pUP_CAGE = round(dplyr::coalesce(pUP_CAGE, 0), 3),
+                pUP_TSS  = round(dplyr::coalesce(pUP_TSS,  0), 3))
+write.csv(pred_targets %>% dplyr::select(gene_id, tx_id, chr, Strand, uORF_start_bio, uORF_length_nt, uORF_length_aa, pUP_CAGE, pUP_TSS),
+          file.path(OUT_DIR, "Table_Predicted_AUG_uORFs_expressed_isoforms.csv"), row.names = FALSE)
+message("wrote Table_Predicted_AUG_uORFs_expressed_isoforms.csv")
+
+.pred_best <- function(col) pred_targets %>%
+  dplyr::group_by(transcript_id = tx_id) %>%
+  dplyr::summarise(n_pred_uORFs = dplyr::n(), Max_pUP_pred = max(.data[[col]], na.rm = TRUE), .groups = "drop")
+pred_best_CAGE <- .pred_best("pUP_CAGE")
+pred_best_TSS  <- .pred_best("pUP_TSS")
+
+## ---- ouORFs: %uORF+ by their start codon, same window/formula as the TuORFs; one row per genomic ouORF ----
+ou_targets <- ouORF %>%
+  dplyr::transmute(unique_key     = paste(tx_id, chr, ORF_gstart, ORF_gstop, sep = "|"),
+                   tx_id          = as.character(tx_id),
+                   chr            = gsub("^chr|^Chr", "", as.character(chr), ignore.case = TRUE),
+                   Strand         = as.character(Strand),
+                   uORF_start_bio = as.integer(ORF_gstart),                 # start codon (A of AUG) on both strands
+                   g_start        = pmin(as.integer(ORF_gstart), as.integer(ORF_gstop)),
+                   g_end          = pmax(as.integer(ORF_gstart), as.integer(ORF_gstop))) %>%
+  dplyr::distinct(unique_key, .keep_all = TRUE)
+tss_windows_ou <- .make_tss_windows(txdb, unique(ou_targets$tx_id))
+.ou_tbl <- function(tss_path) {
+  pp <- as.data.frame(.compute_pUP_for_targets(tss_path, ou_targets, tss_windows_ou))
+  ou_targets %>% dplyr::left_join(pp, by = "unique_key") %>%
+    dplyr::mutate(pUP = dplyr::coalesce(pUP, 0), uorf_gene = sub("\\.\\d+$", "", tx_id)) %>%
+    dplyr::group_by(chr, g_start, g_end, Strand, uorf_gene) %>% dplyr::summarise(pUP = max(pUP), .groups = "drop") %>%   # uorf_gene: same-gene mapping (2026-10-29)
+    as.data.frame()
+}
+ou_tbl_CAGE <- .ou_tbl(PATH_CAGE_CAGEseq)
+ou_tbl_TSS  <- .ou_tbl(PATH_CAGE_TSSseq)
+write.csv(ou_tbl_CAGE %>% dplyr::rename(pUP_CAGE = pUP) %>%
+            dplyr::left_join(ou_tbl_TSS %>% dplyr::rename(pUP_TSS = pUP), by = c("chr", "g_start", "g_end", "Strand", "uorf_gene")) %>%
+            dplyr::mutate(pUP_CAGE = round(pUP_CAGE, 3), pUP_TSS = round(pUP_TSS, 3)),
+          file.path(OUT_DIR, "Table_ouORFs_pUP.csv"), row.names = FALSE)
+message("ouORFs with %uORF+: ", nrow(ou_tbl_CAGE), " (wrote Table_ouORFs_pUP.csv)")
+
+Impact_CAGE   <- run_transcriptome_impact(pUP_CAGE_tbl, "CAGE",   pred_best = pred_best_CAGE, ou_tbl = ou_tbl_CAGE)
+Impact_TSSseq <- run_transcriptome_impact(pUP_TSS_tbl,  "TSSseq", pred_best = pred_best_TSS,  ou_tbl = ou_tbl_TSS)
 
 message("Success! Multi-Isoform aware analysis complete for CAGE-seq AND TSS-seq.")
 
@@ -4331,6 +4813,7 @@ if (length(missing_cols) > 0) stop("DF_All_Evidence missing: ", paste(missing_co
 # 2) Build length base + STANDARDIZE method labels
 # ----------------------------
 df_len_base <- DF_All_Evidence %>%
+  dplyr::filter(ORF_type == "uORF") %>%   # length distributions: non-overlapping uORFs only
   dplyr::select(uORF_id, method, uORF_length) %>%
   dplyr::mutate(
     uORF_id = as.character(uORF_id),
@@ -4634,7 +5117,7 @@ MAX_LOGO_SEQS <- 5000  # cap to keep runtime/memory stable
 # 1) Build genome resources + transcript sequences
 # ----------------------------
 message("Kozak module: loading TxDb + FASTA...")
-txdb_k <- GenomicFeatures::makeTxDbFromGFF(PATH_GTF, format = "gtf")
+txdb_k <- .make_txdb(PATH_GTF, format = "gtf")
 
 tryCatch({ Rsamtools::indexFa(PATH_FASTA_TAIR10) }, error = function(e) NULL)
 fa_k <- Rsamtools::FaFile(PATH_FASTA_TAIR10)
@@ -4773,11 +5256,13 @@ get_pairwise_ks_pvalues_clean <- function(data, group_col, val_col, id_map) {
 }
 
 reorder_letters_by_appearance <- function(named_letters, ordered_groups) {
+  # Re-letter so that the first group reads "a", keeping shared letters (e.g. "ab") per character.
+  # (Fixed 2026-10-28: the previous version mapped whole codes, so a group coded "ab" received a
+  #  single new letter and lost its shared-letter meaning; no submitted panel was affected.)
   current_sequence <- named_letters[ordered_groups]
-  unique_codes <- unique(current_sequence)
-  new_alphabet <- letters[1:length(unique_codes)]
-  mapping <- setNames(new_alphabet, unique_codes)
-  new_letters <- mapping[named_letters]
+  unique_chars <- unique(unlist(strsplit(unname(current_sequence), "")))
+  mapping <- setNames(letters[seq_along(unique_chars)], unique_chars)
+  new_letters <- vapply(unname(named_letters), function(code) paste(mapping[strsplit(code, "")[[1]]], collapse = ""), character(1))
   names(new_letters) <- names(named_letters)
   new_letters
 }
@@ -4840,7 +5325,7 @@ df_uorf_base <- OUT_df6 %>%
     GroupLabel = factor(
       as.character(uIF_Group3),
       levels = c("Weak","Mid","Strong"),
-      labels = c("uORF Weak (uIF<0.5)", "uORF Mid (0.5–1.5)", "uORF Strong (>1.5)")
+      labels = c("uORF low uIF (<0.5)", "uORF medium uIF (0.5–1.5)", "uORF high uIF (>1.5)")
     )
   )
 
@@ -4921,15 +5406,15 @@ if (exists("TE_CDS") && "gene_id" %in% names(TE_CDS)) {
   # fallback: all genes implied by TxDb 5'UTR transcript names
   gene_univ <- unique(toupper(gsub("\\.\\d+$", "", names(fiveUTRs_k))))
 }
-no_uorf_genes <- setdiff(gene_univ, all_uorf_genes)
+no_uorf_genes <- setdiff(gene_univ, union(all_uorf_genes, toupper(ouORF_genes)))   # no TuORF AND no ouORF
 
 # Representative tx: gene+".1"
 make_tx1 <- function(g) paste0(g, ".1")
 
 morf_groups <- list(
-  "mORF (Weak-uIF genes)"    = make_tx1(weak_genes),
-  "mORF (Mid-uIF genes)"     = make_tx1(mid_genes),
-  "mORF (Strong-uIF genes)"  = make_tx1(strong_genes),
+  "mORF (low-uIF genes)"    = make_tx1(weak_genes),
+  "mORF (medium-uIF genes)"     = make_tx1(mid_genes),
+  "mORF (high-uIF genes)"  = make_tx1(strong_genes),
   "mORF (multi-uORF genes)"  = make_tx1(multi_uorf_genes),
   "mORF (no-uORF genes)"     = make_tx1(no_uorf_genes)
 )
@@ -5031,7 +5516,7 @@ p_vio_uorf <- plot_violin_with_letters(
                   if (USE_RNA_FILTER) sprintf(", RNA>=%.2f", MIN_RNA_TPM) else ""),
   ylab = "Kozak score",
   hline_val = ref_uorf_strong,
-  hline_lab = if (is.finite(ref_uorf_strong)) sprintf("Strong median=%.2f", ref_uorf_strong) else NULL
+  hline_lab = if (is.finite(ref_uorf_strong)) sprintf("High-uIF median=%.2f", ref_uorf_strong) else NULL
 )
 
 p_vio_morf <- plot_violin_with_letters(
@@ -5041,7 +5526,7 @@ p_vio_morf <- plot_violin_with_letters(
   title = "mORF Kozak scores by gene group",
   ylab = "Kozak score",
   hline_val = ref_morf_nouorf,
-  hline_lab = if (is.finite(ref_morf_nouorf)) sprintf("No-uORF median=%.2f", ref_morf_nouorf) else NULL
+  hline_lab = if (is.finite(ref_morf_nouorf)) sprintf("No-TuORF median=%.2f", ref_morf_nouorf) else NULL
 )
 
 p_violin_both <- ggpubr::ggarrange(p_vio_uorf, p_vio_morf, ncol = 1, heights = c(1, 1))
@@ -5086,7 +5571,7 @@ p_ecdf_uorf <- plot_ecdf_with_letters(
   title = "ECDF: uORF Kozak scores (uIF groups)",
   xlab = "Kozak score",
   vline_val = ref_uorf_strong,
-  vline_lab = if (is.finite(ref_uorf_strong)) sprintf("Strong median=%.2f", ref_uorf_strong) else NULL
+  vline_lab = if (is.finite(ref_uorf_strong)) sprintf("High-uIF median=%.2f", ref_uorf_strong) else NULL
 )
 print(p_ecdf_uorf)
 save_pdf(p_ecdf_uorf, "Kozak_ECDF_uORF_uIFgroups.pdf", w = 10, h = 6)
@@ -5098,7 +5583,7 @@ p_ecdf_morf <- plot_ecdf_with_letters(
   title = "ECDF: mORF Kozak scores (5 groups)",
   xlab = "Kozak score",
   vline_val = ref_morf_nouorf,
-  vline_lab = if (is.finite(ref_morf_nouorf)) sprintf("No-uORF median=%.2f", ref_morf_nouorf) else NULL
+  vline_lab = if (is.finite(ref_morf_nouorf)) sprintf("No-TuORF median=%.2f", ref_morf_nouorf) else NULL
 )
 print(p_ecdf_morf)
 save_pdf(p_ecdf_morf, "Kozak_ECDF_mORF_groups.pdf", w = 10, h = 6)
@@ -5284,7 +5769,7 @@ safe_range <- function(v) {
 # 5) Build TxDb once for CDS start in transcript coords
 # ----------------------------
 txdb_cor <- if (exists("txdb_k")) txdb_k else if (exists("txdb")) txdb else {
-  GenomicFeatures::makeTxDbFromGFF(
+  .make_txdb(
     file = PATH_GTF, format = "gtf",
     dataSource = "Araport11",
     organism = "Arabidopsis"
@@ -5322,6 +5807,8 @@ df_uorf_cor_base <- OUT_df5_clean %>%
   # keep only uORFs upstream of CDS (avoid negative distances)
   dplyr::filter(!is.na(uORF_stop_tx) & !is.na(CDS_start_tx) & uORF_stop_tx <= CDS_start_tx)
 
+if ("ORF_type" %in% colnames(df_uorf_cor_base))   # distances uORF stop -> CDS start are undefined for ouORFs
+  df_uorf_cor_base <- dplyr::filter(df_uorf_cor_base, ORF_type == "uORF")
 df_uorf_cor_before <- df_uorf_cor_base
 df_uorf_cor_after  <- df_uorf_cor_base %>%
   dplyr::filter(!is.na(pUP) & is.finite(pUP) & pUP >= MIN_PUP_COR) %>%
@@ -5509,7 +5996,7 @@ df_uorf_kozak_after <- df_uorf_kozak_before %>%
 # ----------------------------
 genes_with_uorf_any <- unique(toupper(substr(as.character(mORF_uORF_Info$tx_id), 1, 9)))
 genes_univ_te <- unique(toupper(as.character(TE_CDS_cor$gene_id)))
-genes_no_uorf <- setdiff(genes_univ_te, genes_with_uorf_any)
+genes_no_uorf <- setdiff(genes_univ_te, union(genes_with_uorf_any, toupper(ouORF_genes)))   # no TuORF AND no ouORF
 
 tx_map <- GenomicFeatures::transcripts(txdb_cor, columns = c("TXNAME","GENEID"))
 df_tx_map <- data.frame(
@@ -5763,6 +6250,10 @@ tryCatch({
 
   .add("")
   .add("--- A1. RiboTaper + CiPS TuORF accounting -----------------------------")
+  .add("  NOTE (2026-10-27): evidence rows include CiPS ouORFs treated as TuORFs: ",
+       sum(DF_All_Evidence$ORF_type == "ouORF", na.rm = TRUE), " ouORF rows; in the deduplicated set: ",
+       sum(OUT_df5_clean$ORF_type == "ouORF", na.rm = TRUE), " ouORFs / ",
+       sum(OUT_df5_clean$ORF_type == "uORF", na.rm = TRUE), " uORFs. Length bins (A4) use uORFs only.")
   .add("Raw evidence rows            : RT = ", n_rt_raw, " | CiPS = ", n_cips_raw,
        " | overlapping keys = ", n_keys_both, " | union rows = ", n_union_raw)
   .add("FINAL deduplicated TuORF set (OUT_df5_clean, basis of Table S1A):")

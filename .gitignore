@@ -15,3 +15,4 @@ _to_delete/
 # (unzip them into Files/ before running the script)
 Files/CTRL_expressed_P_sites_sort_count
 Files/TAIR10_chr_all_2.fas
+output_*/
