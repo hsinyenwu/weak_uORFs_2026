@@ -83,11 +83,13 @@ Rscript 20260827_weak_uORFs.R
 
 The script runs as a single pass and writes everything to `output/` (created automatically). To recompute %uORF+ from TSS-seq instead of CAGE-seq, set `TSS_SOURCE <- "TSS"` in section 0 (Table S1 and the transcriptome-impact module always report both sources in one run). A full run takes roughly 25–35 minutes and up to ~10 GB of RAM, most of it in the TxDb/FASTA and CAGE overlap steps.
 
-To run the revision analyses as well (after the main script, in the order their inputs need):
+To run the main script and the revision analyses together, in the order their inputs need:
 
 ```bash
-python3 revision_modules/rerun_all_modules.py
+python3 revision_modules/rerun_all_modules.py --fresh
 ```
+
+`--fresh` runs every step again. Without `--fresh`, the script runs only the steps that have not yet ended without error. It does not check whether an input file or a script has changed.
 
 Some revision modules read data that are not in `Files/` (BAM files, PARE, a second half-life dataset); see [`revision_modules/README.md`](revision_modules/README.md).
 

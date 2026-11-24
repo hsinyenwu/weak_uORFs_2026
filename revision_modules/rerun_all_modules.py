@@ -5,9 +5,12 @@
 Each step starts when the steps it depends on have ended without error; up to six steps run at the same time.
 Logs: output/rerun_logs/<step>.log; status: output/rerun_logs/<step>.json.
 Run from the repository root (the folder that contains 20260827_weak_uORFs.R):
-    python3 revision_modules/rerun_all_modules.py            # every step that has not ended without error yet
-    python3 revision_modules/rerun_all_modules.py A31 A42    # only these steps (the steps they depend on must be done)
-    python3 revision_modules/rerun_all_modules.py --fresh    # forget earlier runs and run everything
+    python3 revision_modules/rerun_all_modules.py --fresh    # forget earlier runs and run every step (use this after an input file or a script has changed)
+    python3 revision_modules/rerun_all_modules.py            # every step that has not ended without error yet (to continue a run that stopped)
+    python3 revision_modules/rerun_all_modules.py A31 A42    # only these steps; the steps they depend on must have ended without error
+2026-11-24: the script stops with a message when a named step depends on a step that has not ended without error (before, it waited without end),
+and when --fresh is given together with step names (before, it removed every record and then waited without end). A step whose program cannot be started
+(for example Rscript is not installed) is recorded as "not started" (before, the script waited without end). An unknown step name gives a message with the list of names.
 Order of the modules (a module after the arrow needs an output of the one before it):
     main script -> A2 -> A3 -> A20 -> A11 -> A12 -> A31 -> A42;  A12 -> A13, A38, A39, A40, A41;  A20 -> A29
     A2 -> A14, A19, A25 -> A25_tables, A25_figure, A26 -> Figure 3C panel (CAGE-seq, then TSS-seq)
@@ -44,17 +47,25 @@ def status(s):
     p = f'{LOG}/{s}.json'; return json.load(open(p))['status'] if os.path.exists(p) else None
 def run(s):
     cmd, deps, env = STEPS[s]; t0 = time.time()
-    with open(f'{LOG}/{s}.log', 'w') as lg: p = subprocess.run(cmd, stdout=lg, stderr=subprocess.STDOUT, env=dict(os.environ, **env))
-    st = f'exit {p.returncode}'; json.dump({'step': s, 'status': st, 'seconds': round(time.time() - t0), 'ended': time.strftime('%Y-%m-%d %H:%M:%S')}, open(f'{LOG}/{s}.json', 'w'))
+    try:
+        with open(f'{LOG}/{s}.log', 'w') as lg: p = subprocess.run(cmd, stdout=lg, stderr=subprocess.STDOUT, env=dict(os.environ, **env))
+        st = f'exit {p.returncode}'
+    except OSError as e: st = f'not started ({e})'   # for example Rscript is not installed; without this, the step stayed "running" and the script waited without end
+    json.dump({'step': s, 'status': st, 'seconds': round(time.time() - t0), 'ended': time.strftime('%Y-%m-%d %H:%M:%S')}, open(f'{LOG}/{s}.json', 'w'))
     print(f'{time.strftime("%H:%M:%S")} {s:14s} {st:8s} {round(time.time() - t0):5d} s', flush=True)
 args = sys.argv[1:]
 if '--fresh' in args:
+    if len(args) > 1: sys.exit('--fresh runs every step again. Give it without step names.')
     for s in STEPS:
         if os.path.exists(f'{LOG}/{s}.json'): os.remove(f'{LOG}/{s}.json')
     args = [a for a in args if a != '--fresh']
 todo = args or [s for s in STEPS if status(s) != 'exit 0']
+todo = list(dict.fromkeys(todo))   # a step named twice runs once
+unknown = [s for s in todo if s not in STEPS]
+if unknown: sys.exit('Unknown step: ' + ', '.join(unknown) + '. The steps are: ' + ', '.join(STEPS) + '.')
+miss = sorted({d for s in todo for d in STEPS[s][1] if d not in todo and status(d) != 'exit 0'})   # only possible when steps are named
+if miss: sys.exit('These steps must end without error before the named steps can run: ' + ', '.join(miss) + '. Run the script without step names (it runs every step that has not ended without error), name these steps too, or run everything with --fresh.')
 for s in todo:
-    assert s in STEPS, s
     if os.path.exists(f'{LOG}/{s}.json'): os.remove(f'{LOG}/{s}.json')
 lock = threading.Lock(); running = set(); done = set(s for s in STEPS if status(s) is not None); sem = threading.Semaphore(6)
 def worker(s):

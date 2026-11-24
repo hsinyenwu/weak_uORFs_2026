@@ -2,23 +2,25 @@
 
 This folder holds the analyses and figure scripts added for the revision of the manuscript "Transcription Start Site Heterogeneity Confounds the Landscape and Functional Interpretation of uORFs". The main pipeline, `20260827_weak_uORFs.R` in the repository root, is the code of the submitted manuscript, updated early in the revision (2026-10-27 to 2026-11-01: the latest CiPS calls, the %uORF+ window of the 5′ leader, the names of the uIF classes); it has not changed since. The modules here read its output tables (`output/Table_S1_all_TuORFs.xlsx`, `output/Table_S2_single_TuORF_genes.xlsx` and others), add the new analyses, and draw the revised figures.
 
-Figure and table numbers below are those of the revised manuscript (version V55, 2026-11-24). The submitted manuscript and the main script use other numbers.
+Figure and table numbers below are those of the revised manuscript (version V56, 2026-11-24). The submitted manuscript and the main script use other numbers.
 
 ## How to run
 
 Run every command from the repository root (the folder that contains `20260827_weak_uORFs.R`), with the inputs in `Files/`.
 
 1. If the CAGE-seq file was replaced, run `Rscript revision_modules/correct_CAGE_positions.R` first. It moves every CAGE-seq position 1 nucleotide upstream (Supplemental Methods, "Positions of the CAGE-seq signal"). It reads the file as received, so it cannot shift the positions twice.
-2. `python3 revision_modules/rerun_all_modules.py` runs the main script, the figure driver and every analysis module below in the order that their inputs need (up to six at the same time; logs in `output/rerun_logs/`). `python3 revision_modules/rerun_all_modules.py A31 A42` runs only those steps. The schematic of Supplemental Fig. S6 (`Fig_schematic_leader_splicing_audit.R`) and the relabelling of the submitted drawings (`relabel_submitted_figure_labels.py`) are run separately.
+2. `python3 revision_modules/rerun_all_modules.py --fresh` runs the main script, the figure driver and every analysis module below. The steps run in the order that their inputs need, up to six at the same time. The logs are in `output/rerun_logs/`. Use this command after an input file or a script has changed. The script records how each step ended (`output/rerun_logs/<step>.json`). `python3 revision_modules/rerun_all_modules.py`, without `--fresh`, runs only the steps that are not recorded as ended without error. It does not check whether an input file or a script has changed. Use it to continue a run that stopped. `python3 revision_modules/rerun_all_modules.py A31 A42` runs only the named steps. Each step that a named step needs must have ended without error or be named in the same command. If not, the script stops with a message. The steps that read the outputs of the named steps are not run again. Do not give step names together with `--fresh`. The schematic of Supplemental Fig. S6 (`Fig_schematic_leader_splicing_audit.R`) and the relabelling of the submitted drawings (`relabel_submitted_figure_labels.py`) are run separately.
 3. The final figure files are made by `revision_modules/finalize_figures.sh`. This script also builds the manuscript files on the authors' computer, with paths outside this repository.
 
-What each step needs before it can run (from `rerun_all_modules.py`):
+What each step needs before it can run (from `rerun_all_modules.py`). The names in the column "Step" are the names that the command accepts:
 
 | Step | Needs |
 |---|---|
-| A5, A6, A7, A8, A9, A15, A16, A17, A21, A22, A23, A30, A33, A35, A36, FigS2_TSSseq_panels | main script |
-| figure driver | main script (the driver is built from it by `build_revised_figure_driver.py`) |
-| A2 | main script |
+| A5, A6, A7, A8, A9, A15, A16, A17, A21, A22, A23, A30, A33, A35, A36, FigS2 (`FigS2_TSSseq_panels.R`) | main |
+| main (the main script, `20260827_weak_uORFs.R`) | nothing |
+| driver_build (`build_revised_figure_driver.py` builds the figure driver from the main script) | nothing |
+| driver (the figure driver) | driver_build and main |
+| A2 | main |
 | A3, A14, A19, A25 | A2 |
 | A20 | A3 |
 | A11, A29 | A20 |
@@ -29,7 +31,8 @@ What each step needs before it can run (from `rerun_all_modules.py`):
 | A42 | A31 |
 | A25_tables | A25 and A20 |
 | A25_figure, A26 | A25 |
-| Fig3C_prevalence_ladder_panel (CAGE-seq, then TSS-seq) | A26 |
+| Fig3C_CAGE (`Fig3C_prevalence_ladder_panel.R` with CAGE-seq) | A26 |
+| Fig3C_TSSseq (the same script with TSS-seq) | Fig3C_CAGE |
 | A34 | A33 and A2 |
 | A18 | A34 |
 | A24 | A23 |
@@ -189,7 +192,7 @@ Most figure files in `output/` keep the name of their module (for example `A6_Fi
 | `compose_main_figures.R`, `compose_main_figures_vector.py` | Composites of Figures 1–4 (raster and vector). |
 | `relabel_submitted_figure_labels.py` | Replaces the old uORF class wording inside the submitted Figure 1 and Figure 7 drawings. |
 | `finalize_figures.sh` | Copies the figure files to their final names and renders PNG images. |
-| `rerun_all_modules.py` | Runs everything in order (see "How to run"). |
+| `rerun_all_modules.py` | Runs the steps in order (see "How to run"; `--fresh` alone runs every step again). |
 | `rerun_figure_modules.sh`, `rerun_for_renumbering_v48.sh` | Older helper scripts that redraw groups of figures. |
 | `render_figures_qa.sh`, `check_figs.py` | Render the figures for inspection; check page size, fonts and text size. |
 | `compare_output_runs.R` | Compares two output folders of the main script, file by file. |
