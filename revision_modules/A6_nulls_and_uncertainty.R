@@ -303,7 +303,7 @@ z2 <- pairs[pairs$N == 2 & ok, ]
 da <- rbind(data.frame(what = "observed", d = z2$delta_obs_tx), data.frame(what = lab_n1, d = z2$null1_mean), data.frame(what = lab_n2, d = z2$null2_mean))
 da$what <- factor(da$what, levels = c("observed", lab_n1, lab_n2))
 pA <- ggplot(da[!is.na(da$d), ], aes(d, colour = what)) + stat_ecdf(linewidth = 0.7) + scale_colour_manual(values = c("black", "#D7191C", "#2C7BB6"), name = NULL) + guides(colour = guide_legend(nrow = 3)) +
-  labs(x = "proximal minus distal %uORF+ (percentage points)", y = "Fraction\nof genes", title = "C  Distal vs proximal TuORF", subtitle = sprintf("genes with two TuORFs (n = %d)\nmedians: observed %.0f, null 1: %.0f, null 2: %.0f points", nrow(z2), med(z2$delta_obs_tx), med(z2$null1_mean), med(z2$null2_mean))) + th + theme(legend.direction = "vertical")
+  labs(x = "proximal minus distal %uORF+ (percentage points)", y = "Fraction\nof genes", title = "C  Distal vs proximal TuORF", subtitle = sprintf("genes with two TuORFs (n = %s)\nmedians: observed %.0f, null 1: %.0f, null 2: %.0f points", big(nrow(z2)), med(z2$delta_obs_tx), med(z2$null1_mean), med(z2$null2_mean))) + th + theme(legend.direction = "vertical")
 # panel A: pUP with intervals (drawn as pB)
 db <- U[order(pUP)]; db[, rank := seq_len(.N) / .N]
 pB <- ggplot(db, aes(x = rank)) + geom_ribbon(aes(ymin = ci_lo, ymax = ci_hi), fill = "grey70") + geom_line(aes(y = pUP), colour = "black", linewidth = 0.5) + geom_hline(yintercept = c(90, 100), linetype = 3, linewidth = 0.3) +
@@ -313,16 +313,18 @@ ds_plot <- melt(sat_tab[, .(method, million_reads, fraction_of_reads, `below 100
 pSat <- ggplot(ds_plot, aes(million_reads, pct, colour = method, linetype = call, group = interaction(method, call))) + geom_line(linewidth = 0.6) + geom_point(size = 1) +
   geom_point(data = ds_plot[fraction_of_reads == 1], shape = 21, fill = "white", size = 2, stroke = 0.7) +
   scale_colour_manual(values = c(`CAGE-seq` = "black", `TSS-seq` = "#2C7BB6"), name = NULL) + scale_linetype_manual(values = c(`below 100%` = "solid", `below 90%` = "22"), name = NULL) +
-  scale_y_continuous(limits = c(45, 100)) +
+  scale_y_continuous(limits = c(45, 108), breaks = c(60, 80, 100)) +   # V57: room for the keys above the curves (the panel is a little lower)
   labs(x = "Reads sampled from the library (million)", y = "% of single-TuORF\ngenes", title = "B  %uORF+ calls by read depth", subtitle = "reads sampled at random; open circles: all reads") + th
 # D: length vs exclusion observed vs random placement
 dd <- melt(merge(len_tab[, .(bin, observed = observed_pct_excluded, expected = expected_pct_excluded)], pm[, .(bin, predicted = predicted_from_position_only)], by = "bin", all.x = TRUE), id.vars = "bin", variable.name = "what", value.name = "pct")
 dd[, what := factor(what, levels = c("observed", "expected", "predicted"))]   # V49: short keys; the schematic at the right of D (pExp) explains them
-pD <- ggplot(dd[!is.na(pct)], aes(bin, pct, fill = what)) + geom_col(position = position_dodge(0.8), width = 0.75) + scale_fill_manual(values = c("#D7191C", "grey60", "#2C7BB6"), name = NULL) + guides(fill = guide_legend(nrow = 3)) +
+# V57 (2026-11-24, Larry: "The legend and the right side of the panel D is too simple and cannot be understood. Add more clear explaination in both."): keys and subtitle say what each bar is
+pD <- ggplot(dd[!is.na(pct)], aes(bin, pct, fill = what)) + geom_col(position = position_dodge(0.8), width = 0.75) +
+  scale_fill_manual(values = c(observed = "#D7191C", expected = "grey60", predicted = "#2C7BB6"), labels = c(observed = "observed", expected = "expected for all possible positions", predicted = "predicted from the real position"), name = NULL) + guides(fill = guide_legend(nrow = 3)) +
   geom_text(data = len_tab, aes(bin, pmax(observed_pct_excluded, expected_pct_excluded) + 3, label = sprintf("%+.0f", excess_points)), inherit.aes = FALSE, size = 2.6) +
-  labs(x = "uORF length (aa)", y = sprintf("%% excluded\n(%%uORF+ ≤ %d)", EXCL), title = "D  uORF length vs exclusion", subtitle = "labels: observed minus expected (points)") + th + theme(legend.direction = "vertical", legend.text = element_text(size = 6.5))
+  labs(x = "uORF length (aa)", y = sprintf("%% excluded\n(%%uORF+ ≤ %d)", EXCL), title = "D  uORF length vs exclusion", subtitle = sprintf("%s of the %s single-TuORF genes; gray and blue are higher for longer uORFs (from 2–10 aa to more than 30 aa) because a longer uORF starts further from the mORF start codon, so fewer transcripts contain it; numbers above the bars: red minus gray (percentage points)", big(nrow(L[okL & !is.na(exp_excl)])), big(nrow(L)))) + th + theme(legend.direction = "vertical", legend.text = element_text(size = 6.5))
 # room for the labels of D (the strata by distance are in Table S4, sheet length_strata)
-pD <- pD + scale_y_continuous(expand = expansion(mult = c(0.02, 0.22)))   # room for the difference labels above the bars
+pD <- pD + scale_x_discrete(labels = function(x) sub("-", "–", x, fixed = TRUE)) + scale_y_continuous(expand = expansion(mult = c(0.02, 0.45)))   # room for the difference labels above the bars and for the keys (V57: longer keys)
 # panel E: odds ratios
 # V49 (2026-11-17, Larry: "Yes, simplify E"): two models in four rows, the model with uORF length and the 1-aa term, before and after adjustment for position;
 # the model with position only and the model with the distance from the annotated 5' end stay in Table S4 (sheet logistic_models)
@@ -333,11 +335,12 @@ mf[, row := factor(c(`length (per doubling)` = "uORF length (per doubling)", `1-
                    levels = rev(c("uORF length (per doubling)", "1-aa uORF (compared with the length trend)", "distance from the uORF start to the mORF (per doubling)", "leader length (per doubling)")))]
 mf[, fit := factor(ifelse(model == M_BEFORE, "before adjustment", "adjusted for position"), levels = c("adjusted for position", "before adjustment"))]   # this order puts the model before adjustment above the adjusted one in each row
 pF <- ggplot(mf, aes(OR, row, colour = fit)) + geom_vline(xintercept = 1, linetype = 3) +
-  geom_errorbar(aes(xmin = lo, xmax = hi), width = 0.25, orientation = "y", position = position_dodge(0.55)) + geom_point(size = 2, position = position_dodge(0.55)) +
-  geom_text(aes(x = hi, label = sprintf("%.2f", OR)), hjust = -0.25, size = 2.8, position = position_dodge(0.55), show.legend = FALSE) +
+  geom_errorbar(aes(xmin = lo, xmax = hi), width = 0.25, orientation = "y", position = position_dodge(0.8)) + geom_point(size = 2, position = position_dodge(0.8)) +   # V57: 0.8 (was 0.55), so that the two labels of a row do not overlap
+  geom_text(aes(x = hi, label = sprintf("%.2f", OR), vjust = ifelse(fit == "before adjustment", 0.15, 0.85)), hjust = -0.25, size = 2.8, position = position_dodge(0.8), show.legend = FALSE) +   # V57: the gray label above its line, the red label below its line
+  scale_y_discrete(expand = expansion(add = c(0.75, 0.9))) +   # V57: room above the top row for its gray label
   scale_x_log10(expand = expansion(mult = c(0.05, 0.12))) + scale_colour_manual(values = c(`before adjustment` = "grey45", `adjusted for position` = "#D7191C"), breaks = c("before adjustment", "adjusted for position"), name = NULL) +
   labs(x = "Odds ratio for exclusion (95% confidence interval, log scale)", y = NULL, title = "E  Odds of exclusion before and after adjustment for position",
-       subtitle = sprintf("single-TuORF genes (n = %s); both models have uORF length and a term for the 1-aa uORFs; position = the distance from the uORF start to the mORF and the leader length; numbers: odds ratios", big(nrow(Lm)))) + th
+       subtitle = sprintf("%s of the %s single-TuORF genes; both models have uORF length and a term for the 1-aa uORFs; position means the distance from the uORF start codon to the mORF start codon and the leader length", big(nrow(Lm)), big(nrow(L)))) + th
 source("revision_modules/fig_compact.R")   # 6.5 x <= 9 in, Arial, >= 8 pt (2026-10-28)
 # panel C, right: how the observed difference and the two nulls are calculated (schematic with text, 8 pt; V49, 2026-11-17)
 PD <- 28; PP <- 52; XM <- 78; TXT <- FIG_PT_MIN / .pt; RED <- "#D7191C"; BLU <- "#2C7BB6"
@@ -364,18 +367,25 @@ pNull <- ggplot() + scale_x_continuous(limits = c(0, 100), expand = c(0, 0)) + s
   note(-4, sprintf("null 2 (blue): positions at the same distances\nfrom the mORF start in %d random No-TuORF\nleaders; mean of the differences", N_CTRL)) +
   labs(title = "How the curves of C are calculated") +
   theme(plot.title = element_text(family = FIG_FONT, size = FIG_PT_MIN + 2, face = "bold"), plot.title.position = "plot", plot.margin = margin(4, 10, 6, 8))
-# panel D, right: what "expected" and "predicted" mean (schematic with text, 8 pt; V49, 2026-11-17)
-pExp <- ggplot() + scale_x_continuous(limits = c(0, 100), expand = c(0, 0)) + scale_y_continuous(limits = c(-10, 100), expand = c(0, 0)) + theme_void() + coord_cartesian(clip = "off") +
-  note(99, "Observed (red): % of the TuORFs in each length\ngroup that are excluded (%uORF+ ≤ 30)") +
-  sch_leader(71, 2, pk1, ph1) +
-  annotate("rect", xmin = c(4, 30, 56), xmax = c(4, 30, 56) + 18, ymin = c(74, 77.5, 81), ymax = c(74, 77.5, 81) + 2.2, fill = "grey60") +
-  note(67, "Expected (gray): an ORF of the same length placed\nat every position of the same leader where it fits;\n% of these positions at which it is excluded") +
-  sch_leader(40, 2) +   # no CAGE bars: the model uses only the two lengths
-  annotate("rect", xmin = 30, xmax = 48, ymin = 38.6, ymax = 41.4, fill = BLU) +
-  annotate("segment", x = c(30, 2), xend = c(XM, XM), y = c(34.5, 24.5), yend = c(34.5, 24.5), linewidth = 0.45, colour = "grey20", arrow = arrow(length = unit(1.1, "mm"), ends = "both", type = "closed")) +
-  annotate("text", x = c((30 + XM) / 2, (2 + XM) / 2), y = c(33, 23), label = c("distance to the mORF", "leader length"), vjust = 1, size = TXT, family = FIG_FONT) +
-  note(13, "Predicted (blue): a model with only these two\nlengths (no uORF length), fitted to all TuORFs;\nmean predicted exclusion of each group") +
-  labs(title = "What the bars of D mean") +
+# panel D, right: how the three bars of D are calculated (schematic with text, 8 pt; V49, 2026-11-17)
+# V57 (2026-11-24, Larry: "The legend and the right side of the panel D is too simple and cannot be understood. Add more clear explaination in both."):
+# one drawing and one paragraph for each bar, and a last paragraph on why red is lower than gray (why gray and blue rise with length: subtitle of D)
+# y: about 0.85 pt per unit (the cell is about 2.8 in high; text lines are about 10 pt apart); at most about 72 characters per line in the 60% width
+xs_g <- c(4, 17, 30, 43, 56); ys_g <- c(165.5, 169.5, 165.5, 169.5, 165.5); ph_pt <- c(8, 5, 7, 10, 5); ph_g <- c(5, 3, 4, 6, 3)
+lab_on <- function(x, y, lab, hjust = 0.5) annotate("label", x = x, y = y, label = lab, hjust = hjust, size = TXT, family = FIG_FONT, fill = "white", border.colour = "white", label.padding = unit(0.6, "pt"))
+pExp <- ggplot() + scale_x_continuous(limits = c(0, 100), expand = c(0, 0)) + scale_y_continuous(limits = c(-6, 200), expand = c(0, 0)) + theme_void() + coord_cartesian(clip = "off") +
+  sch_leader(192, 2, pk1, ph_pt) + annotate("rect", xmin = 40, xmax = 58, ymin = 190.2, ymax = 193.8, fill = RED) +
+  note(186, "Red, observed: percentage of TuORFs with %uORF+ ≤ 30 (excluded)") +
+  sch_leader(155, 2, pk1, ph_g) +
+  annotate("rect", xmin = xs_g, xmax = xs_g + 18, ymin = ys_g - 1.5, ymax = ys_g + 1.5, fill = "grey60") +
+  note(150, "Gray, expected for all possible positions: an ORF of the same length is\nplaced at every nucleotide position of the leader where it fits. The bar\nis the percentage of positions with %uORF+ ≤ 30 (calculated from the CAGE\nsignal, gray ticks), averaged over the TuORFs of the group.") +
+  sch_leader(97, 2) +   # no CAGE ticks: the model uses only the two distances
+  annotate("rect", xmin = 22, xmax = 40, ymin = 95.2, ymax = 98.8, fill = BLU) +
+  annotate("segment", x = c(22, 2), xend = c(XM, XM), y = c(87.5, 76), yend = c(87.5, 76), linewidth = 0.45, colour = "grey20", arrow = arrow(length = unit(1.1, "mm"), ends = "both", type = "closed")) +
+  lab_on((22 + XM) / 2, 87.5, "distance to the mORF start codon") + lab_on((2 + XM) / 2, 76, "leader length") +
+  note(68, "Blue, predicted from the real position: a logistic model with only these\ntwo values, fitted to all TuORFs of D, gives each TuORF a probability of\nexclusion. The bar is the mean probability. Over all groups, blue and red\nhave the same mean; red above blue means more exclusion than predicted.") +
+  note(17, "Red is lower than gray in every group because a uORF that is present in\nfew mRNAs is less likely to be detected by Ribo-seq.") +
+  labs(title = "How the three bars of D are calculated") +
   theme(plot.title = element_text(family = FIG_FONT, size = FIG_PT_MIN + 2, face = "bold"), plot.title.position = "plot", plot.margin = margin(4, 10, 6, 8))
 # V30 (2026-11-09, Larry): legends inside the plots or at the side; the panels of a row share their plotting area (fig_grid)
 # V49 (2026-11-17): panels in the order of their first citation in the text: A = interval (pB), B = the two calls by sequencing depth (pSat),
@@ -384,7 +394,8 @@ pExp <- ggplot() + scale_x_continuous(limits = c(0, 100), expand = c(0, 0)) + sc
 cS6 <- c(lapply(list(pB, pSat, pA), compact), list(patchwork::free(pNull), compact(pD), patchwork::free(pExp), compact_wide(pF)))
 cS6[[2]] <- legend_in(cS6[[2]], 0.02, 0.98) + theme(legend.box = "horizontal")
 cS6[[3]] <- legend_in(cS6[[3]], 0.99, 0.03); cS6[[5]] <- legend_in(cS6[[5]], 0.02, 0.98); cS6[[7]] <- legend_in(cS6[[7]], 0.01, 0.98)
-g <- fig_grid(cS6, design = "AB\nCD\nEF\nGG", heights = c(1.15, 1.3, 1.25, 0.95), top = fig_title("Figure S3. Null models and uncertainty for the TSS effects"))   # C, D and E need the full width
+g <- fig_grid(cS6, design = "AAAAABBBBB\nCCCCCDDDDD\nEEEEFFFFFF\nGGGGGGGGGG", heights = c(0.95, 1.4, 1.75, 1.0),   # V57: D 40% and its explanation 60% of the width, more height for this row
+              top = fig_title("Figure S3. Null models and uncertainty for the TSS effects"))   # C, D and E need the full width
 fig_save(file.path(OUT_DIR, "A6_Figure_nulls_and_uncertainty.pdf"), g, h = 9)
 .add(sprintf("Done in %.1f min", as.numeric(difftime(Sys.time(), t0, units = "mins"))))
 writeLines(.log, file.path(OUT_DIR, "A6_summary.txt"))
